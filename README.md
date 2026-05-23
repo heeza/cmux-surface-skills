@@ -43,10 +43,38 @@ ANSWER=$(suf_ask surface:4 "현황 보고")
 
 ## 설치
 
+전체 셋업은 **의존성 1개 + 3단계**.
+
+### 1. cmux 설치
+
+`suf` 와 `cmux` 스킬의 필수 의존성.
+
+```bash
+brew install cmux   # 또는 https://cmux.run 가이드
+```
+
+### 2. Clone (경로 고정)
+
+심볼릭이 상대경로 (`../../.agents/...`) 를 가정하므로 **반드시 `~/.agents`** 로 clone.
+
 ```bash
 git clone https://github.com/heeza/cmux-surface-skills.git ~/.agents
+```
 
-# Claude Code 에서 인식되도록 심볼릭
+### 3. 에이전트 도구별 노출
+
+#### Claude Code — 원하는 스킬만 (권장)
+
+```bash
+mkdir -p ~/.claude/skills
+for skill in suf find-skills caveman; do
+  ln -sfn "../../.agents/skills/$skill" "$HOME/.claude/skills/$skill"
+done
+```
+
+#### Claude Code — 전체 스킬 일괄 노출
+
+```bash
 mkdir -p ~/.claude/skills
 for skill in ~/.agents/skills/*/; do
   name=$(basename "$skill")
@@ -54,7 +82,18 @@ for skill in ~/.agents/skills/*/; do
 done
 ```
 
-Codex 는 `AGENTS.md` 에서 `~/.agents/` 를 참조하도록 설정.
+#### Codex — AGENTS.md 에 import
+
+```bash
+mkdir -p ~/.codex
+printf '\n@%s/.agents/skills/suf/SKILL.md\n' "$HOME" >> ~/.codex/AGENTS.md
+```
+
+다른 스킬도 노출하려면 같은 패턴으로 `@$HOME/.agents/skills/<name>/SKILL.md` 라인 추가.
+
+#### Gemini
+
+Gemini CLI 는 별도 스킬 시스템이 없어 자동 노출 안 됨. 필요하면 `~/.gemini/` 설정에서 system prompt 로 `@~/.agents/skills/<name>/SKILL.md` 류 임포트.
 
 ## 의존성
 
