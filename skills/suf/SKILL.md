@@ -5,7 +5,16 @@ description: cmux sidecar 와 마커 + read-screen 폴링으로 통신하는 age
 
 # suf — agent ↔ agent 통신
 
-## 한 사이클 (v3)
+## 두 가지 모드
+
+| 모드 | 용도 | 채널 | 응답 길이 |
+|---|---|---|---|
+| **inline** (`suf_ask`) | 짧은 텍스트 ack/요약 | screen scrollback | ~수천 줄 (cap) |
+| **file** (`suf_ask_file`) | 대용량 본문 (JSON, 로그, 코드, 문서) | `/tmp/suf-spool/<job>.out` + screen 으로 path/size/sha256 | 제한 없음 |
+
+기본은 inline. body 가 클 것 같으면 file 모드. 둘 다 마커 프로토콜은 동일.
+
+## 한 사이클 (v3, inline)
 
 ```
 say → poll-extract → grace → re-extract
@@ -54,7 +63,10 @@ ANSWER=$(suf_ask surface:22 "현황 보고")
 
 | 함수 | 역할 |
 |---|---|
-| `suf_ask <surface> <prompt> [timeout]` | **say + poll + extract 한 번에**. 99% 이것만. |
+| `suf_ask <surface> <prompt> [timeout]` | inline: **say + poll + extract 한 번에**. 99% 이것만. |
+| `suf_ask_file <surface> <prompt> [timeout]` | file 모드: sidecar 답변을 spool 파일로 받음. **절대 경로 반환**. 호출자가 cat / 삭제. |
+| `suf_send_file <surface> <local-path> <prompt> [timeout]` | parent → sidecar 로 큰 입력 전달. spool 에 복사 후 path+sha 알려주고 inline 답변 수신. |
+| `suf_cleanup_spool [<job>]` | spool 정리. 인자 없으면 24h+ 묵은 것 삭제. |
 | `suf_say <surface> <prompt>` | 송신만, JOB 반환 (fire-and-forget) |
 | `suf_wait <surface> <job> [timeout]` | 닫힌 pair ≥ 2 까지 폴링 |
 | `suf_hear <surface> <job>` | 즉시 추출 (대기 없음) |
@@ -63,7 +75,8 @@ ANSWER=$(suf_ask surface:22 "현황 보고")
 환경변수:
 - `SUF_POLL_INTERVAL` (기본 0.5초) — 폴링 주기
 - `SUF_GRACE` (기본 0.5초) — wait 성공 후 extract 전 안정화 대기
-- `SUF_READ_LINES` (기본 8000) — read-screen scrollback 라인 수. 응답이 더 길면 늘리기.
+- `SUF_READ_LINES` (기본 8000) — read-screen scrollback 라인 수. inline 모드에서만 의미 있음.
+- `SUF_SPOOL_DIR` (기본 `/tmp/suf-spool`) — file 모드 spool 위치. mode 0700 으로 자동 생성.
 
 인라인으로 직접 짤 일이 생기면, sidecar 프롬프트는 다음 골격을 따른다:
 
@@ -78,15 +91,56 @@ ANSWER=$(suf_ask surface:22 "현황 보고")
 
 별도 ack 명령 불필요 — sidecar 가 마커 사이에 답만 쓰면 끝.
 
-## v1 → v3 개선점 요약
+## file 모드 디테일
 
-| 항목 | v1 | v3 |
-|---|---|---|
-| 매칭 모델 | END 마커 횟수 ≥ 2 (열려있는 END 도 카운트) | **닫힌 ANSWER..END pair ≥ 2** (echo placeholder 자동 제외) |
-| scrollback 한계 | 4000줄 | 8000줄 (`SUF_READ_LINES` 로 조정) |
-| polling 주기 | 1초 | 0.5초 |
-| job 충돌 | `ns-PID` (같은 ns 동시 호출 충돌) | `ns-PID-urandom4hex` |
-| 추출 단위 함수 | `suf_hear` 별도 호출 | `_suf_try_extract` 내부 공유 |
+```bash
+source ~/.agents/skills/suf/scripts/suf-lib.sh
+
+# 대용량 답변 받기
+path=$(suf_ask_file surface:22 "전체 로그 줘") || exit 1
+wc -l "$path"; head -100 "$path"
+rm -f "$path"
+
+# 대용량 입력 보내기
+text_answer=$(suf_send_file surface:22 ./big-input.json "이거 분석해줘")
+```
+
+### 마커 안 페이로드 (file 모드)
+
+```
+<<<SUF_ANSWER:$job>>>
+SUF_FILE: /tmp/suf-spool/<job>.out
+SUF_SIZE: 12345
+SUF_SHA256: abc123...
+<<<SUF_END:$job>>>
+```
+
+parent 측 검증: 파일 존재 → `wc -c` 와 `SUF_SIZE` 일치 → `shasum -a 256` 와 `SUF_SHA256` 일치. 어느 하나 어긋나면 exit 코드 2/3/4 로 실패.
+
+### sidecar 가 받는 instruction
+
+`suf_ask_file` 은 prompt 끝에 **shell 한 줄 그대로 복붙 가능한 템플릿**을 붙임:
+
+```bash
+cat > /tmp/suf-spool/<job>.out.tmp <<'EOF_SUF_BODY'
+(여기에 답변 본문)
+EOF_SUF_BODY
+mv ...tmp ...out && \
+  printf '<<<SUF_ANSWER:%s>>>\nSUF_FILE: %s\nSUF_SIZE: %s\nSUF_SHA256: %s\n<<<SUF_END:%s>>>\n' ...
+```
+
+sidecar 가 Claude/Codex 라면 Bash 툴로 실행. 일반 shell 이면 그대로 paste. atomic rename 으로 parent 가 부분쓰기 파일을 잡는 race 방지.
+
+## v1 → v4 개선점 요약
+
+| 항목 | v1 | v3 | v4 |
+|---|---|---|---|
+| 매칭 모델 | END 횟수 ≥ 2 (열린 END 도 카운트) | **닫힌 ANSWER..END pair ≥ 2** | (v3 유지) |
+| scrollback 한계 | 4000줄 | 8000줄 (`SUF_READ_LINES`) | inline 은 동일, **file 모드는 무관** |
+| polling 주기 | 1초 | 0.5초 | (v3 유지) |
+| job 충돌 | `ns-PID` | `ns-PID-urandom4hex` | (v3 유지) |
+| 대용량 payload | screen cap 에 묶임 | 동일 | **`/tmp/suf-spool/` 파일 채널 + size+sha256 검증** |
+| input 대용량 | 입력창 길이 의존 | 동일 | **`suf_send_file` 로 file path 전달** |
 
 ## 함정
 
@@ -94,8 +148,11 @@ ANSWER=$(suf_ask surface:22 "현황 보고")
 - **self 에게 send** — 데드락. `suf_other_surfaces` / `$CMUX_SURFACE_ID` 로 self 배제. 같은 함수가 **다른 워크스페이스의 surface 도 자동 제외**한다.
 - **사용자 surface 를 close** — 금지. 부모가 만든 sidecar 만 정리.
 - **sidecar 가 마커 빠뜨림** — closed pair 1개 (echo) 에서 멈춰 timeout. 프롬프트에 마커 사용 지시가 명확해야 함.
-- **응답 매우 길어 scrollback 밖으로 밀림** — `SUF_READ_LINES=20000` 식으로 늘리거나, 답변을 파일로 받기 (sidecar 가 파일 저장 후 path 만 마커 안에).
+- **응답 매우 길어 scrollback 밖으로 밀림** — inline 의 본질적 한계. **`suf_ask_file` 로 전환**. `SUF_READ_LINES=20000` 식 임시 조치도 가능하지만 파일 모드가 정답.
 - **TUI 가 아닌 일반 shell** — pair 카운팅 동일하게 작동. shell echo 가 raw text 라 closed pair 1 + 응답 1 = 2 로 자연 일치.
+- **file 모드에서 sidecar 가 본문을 inline 으로 출력** — SUF_FILE 라인 없는 pair 라 timeout. prompt 가 충분히 명확해도 일부 sidecar 가 file write 거부할 수 있음. 그 경우 `suf_ask` 로 대체.
+- **size/sha256 mismatch (exit 3/4)** — sidecar 가 mv 전에 메타를 계산했거나 파일이 중간에 덮어쓰임. 같은 JOB 재시도하지 말고 새 JOB 으로 다시 호출.
+- **spool 누수** — file 모드 호출자가 명시적으로 `rm` 안 하면 24h 후 `suf_cleanup_spool` 이 청소. 민감 데이터면 호출 직후 삭제.
 
 ## 확장 — fan-in / 진척 보고
 
