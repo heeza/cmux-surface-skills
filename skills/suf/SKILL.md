@@ -90,6 +90,19 @@ suf_other_surfaces
 | `SUF_V5_TIMEOUT` | 30 | blocking read 초 |
 | `SUF_V5_AUTO_CAP` | on | prompt 끝에 안내문 자동 첨부 (`off` 로 끔) |
 | `SUF_V5_FIFO_DIR` | `/tmp/suf-fifo` | FIFO 디렉토리 (mode 0700) |
+| `SUF_V5_QUIET` | off | stderr 한 줄 status 표시 (`on` 으로 끔) |
+| `SUF_V5_ENTER_DELAY` | 0.15 | send 후 Enter 까지 지연 (초) — race 회피 |
+| `SUF_V5_ENTER_DOUBLE` | on | Enter 휘발 보험 위해 한 번 더 송신 (`off` 로 끔) |
+
+### Status line (default 표시)
+
+```
+[suf v5] surface:9 (llm) 4s 18B ok
+[suf v5] surface:11 (worker) 30s 0B timeout
+[suf v5] surface:9 (llm) 12s 4096B ok,truncated
+```
+
+`<surface> (<mode>) <elapsed>s <bytes>B <result>`. 호출자가 응답 stdout 만 받고 status 는 stderr 라 파이프라인 안전.
 
 ## 자동 감지 (LLM vs worker)
 

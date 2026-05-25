@@ -216,14 +216,28 @@ _suf_v5_dispatch() {
     return 5
   fi
 
-  local out rc
+  local out rc start elapsed mark
+  start=$(date +%s)
   out="$(_suf_v5_read_fifo "$fifo" "$timeout" "$rmax")"
   rc=$?
+  elapsed=$(( $(date +%s) - start ))
   rm -f "$fifo"
-  printf '%s' "$out"
-  if [ "$rc" -eq 0 ] && [ "${#out}" -ge "$rmax" ]; then
-    printf '\n[suf v5] response truncated at %d bytes.\n' "$rmax" >&2
+
+  # stderr 한 줄 status (default on, SUF_V5_QUIET=on 으로 끔)
+  if [ "${SUF_V5_QUIET:-off}" != "on" ]; then
+    case "$rc" in
+      0)   mark="ok" ;;
+      124) mark="timeout" ;;
+      *)   mark="rc=$rc" ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "${#out}" -ge "$rmax" ]; then
+      mark="$mark,truncated"
+    fi
+    printf '[suf v5] %s (%s) %ds %dB %s\n' \
+      "$surface" "$mode" "$elapsed" "${#out}" "$mark" >&2
   fi
+
+  printf '%s' "$out"
   return $rc
 }
 

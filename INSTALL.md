@@ -229,6 +229,12 @@ export SUF_V5_AUTO_CAP=off
 
 # FIFO 위치 변경
 export SUF_V5_FIFO_DIR=/tmp/my-suf
+
+# stderr 한 줄 status 끄고 응답 본문만 받기 (script 출력용)
+export SUF_V5_QUIET=on
+
+# Enter race 더 보수적으로 (느린 머신 / 무거운 sidecar)
+export SUF_V5_ENTER_DELAY=0.3
 ```
 
 ---
