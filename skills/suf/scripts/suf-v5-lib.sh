@@ -293,6 +293,179 @@ suf_ask_unsafe() {
   _suf_v5_dispatch "$surface" "$prompt" "$mode" "$timeout" "$response_max"
 }
 
+# ---- async fire-and-collect API ----
+
+# 송신만. fifo 생성 + cmux send. stdout=job_id, stderr=status.
+# suf_send <surface> <prompt> [--mode llm|worker]
+suf_send() {
+  if [ $# -lt 2 ]; then
+    printf 'usage: suf_send <surface> <prompt> [--mode llm|worker]\n' >&2
+    return 2
+  fi
+  local surface="$1" prompt="$2" mode=""
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) mode="$2"; shift 2 ;;
+      *) printf '[suf v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  if [ "${#prompt}" -gt "$SUF_V5_PROMPT_MAX" ]; then
+    printf '[suf v5] prompt size %d > PROMPT_MAX=%d\n' "${#prompt}" "$SUF_V5_PROMPT_MAX" >&2
+    return 2
+  fi
+
+  if [ -z "$mode" ]; then
+    mode="$(_suf_v5_detect "$surface")"
+  fi
+  if [ "$mode" = "unknown" ]; then
+    printf '[suf v5] cannot auto-detect sidecar on %s. use --mode llm|worker.\n' \
+      "$surface" >&2
+    return 3
+  fi
+
+  local job fifo
+  job="$(_suf_v5_job)"
+  fifo="$(_suf_v5_make_fifo "$job")" || { printf '[suf v5] mkfifo failed\n' >&2; return 4; }
+
+  local full
+  case "$mode" in
+    llm)    full="$(_suf_v5_llm_prompt    "$prompt" "$fifo")" ;;
+    worker) full="$(_suf_v5_worker_prompt "$prompt" "$fifo")" ;;
+    *) printf '[suf v5] bad mode: %s\n' "$mode" >&2; rm -f "$fifo"; return 2 ;;
+  esac
+
+  if ! _suf_v5_send "$surface" "$full"; then
+    printf '[suf v5] cmux send failed (surface=%s)\n' "$surface" >&2
+    rm -f "$fifo"
+    return 5
+  fi
+
+  if [ "${SUF_V5_QUIET:-off}" != "on" ]; then
+    printf '[suf v5] %s (%s) sent, job=%s\n' "$surface" "$mode" "$job" >&2
+  fi
+  printf '%s' "$job"
+}
+
+# fifo blocking read. stdout=본문, stderr=status, rc=read_fifo rc.
+# suf_collect <job> [--timeout N] [--response-max N]
+suf_collect() {
+  if [ $# -lt 1 ]; then
+    printf 'usage: suf_collect <job> [--timeout N] [--response-max N]\n' >&2
+    return 2
+  fi
+  local job="$1" timeout="$SUF_V5_TIMEOUT" rmax="$SUF_V5_RESPONSE_MAX"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout)      timeout="$2"; shift 2 ;;
+      --response-max) rmax="$2"; shift 2 ;;
+      *) printf '[suf v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  local fifo
+  fifo="$(_suf_v5_fifo_path "$job")"
+  if [ ! -p "$fifo" ]; then
+    printf '[suf v5] no such job: %s\n' "$job" >&2
+    return 6
+  fi
+
+  local out rc start elapsed mark
+  start=$(date +%s)
+  out="$(_suf_v5_read_fifo "$fifo" "$timeout" "$rmax")"
+  rc=$?
+  elapsed=$(( $(date +%s) - start ))
+  rm -f "$fifo"
+
+  if [ "${SUF_V5_QUIET:-off}" != "on" ]; then
+    case "$rc" in
+      0)   mark="ok" ;;
+      124) mark="timeout" ;;
+      *)   mark="rc=$rc" ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "${#out}" -ge "$rmax" ]; then mark="$mark,truncated"; fi
+    printf '[suf v5] collect %s %ds %dB %s\n' "$job" "$elapsed" "${#out}" "$mark" >&2
+  fi
+  printf '%s' "$out"
+  return $rc
+}
+
+# non-blocking 체크. rc: 0=data ready, 1=not yet, 2=no such job.
+# suf_check <job>
+suf_check() {
+  [ $# -ge 1 ] || { printf 'usage: suf_check <job>\n' >&2; return 2; }
+  local fifo
+  fifo="$(_suf_v5_fifo_path "$1")"
+  [ -p "$fifo" ] || return 2
+  perl - "$fifo" <<'PERL'
+use Fcntl qw(O_RDONLY O_NONBLOCK);
+use IO::Select;
+sysopen(my $fh, $ARGV[0], O_RDONLY | O_NONBLOCK) or exit 2;
+my $s = IO::Select->new($fh);
+exit ($s->can_read(0) ? 0 : 1);
+PERL
+}
+
+# line 단위 stream until EOF (sidecar 가 fifo close).
+# 한 writer 로 line print + close 패턴에서만 작동.
+# suf_tail <job> [--timeout N]
+suf_tail() {
+  [ $# -ge 1 ] || { printf 'usage: suf_tail <job> [--timeout N]\n' >&2; return 2; }
+  local job="$1" timeout="$SUF_V5_TIMEOUT"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="$2"; shift 2 ;;
+      *) printf '[suf v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  local fifo
+  fifo="$(_suf_v5_fifo_path "$job")"
+  if [ ! -p "$fifo" ]; then
+    printf '[suf v5] no such job: %s\n' "$job" >&2
+    return 6
+  fi
+  perl - "$timeout" "$fifo" <<'PERL'
+my ($timeout, $fifo) = @ARGV;
+$SIG{ALRM} = sub { print STDERR "[suf v5] tail timeout\n"; exit 124 };
+alarm $timeout;
+open(my $fh, "<", $fifo) or do { print STDERR "[suf v5] tail open fail: $!\n"; exit 5 };
+my $n = 0;
+while (defined(my $line = <$fh>)) {
+  print $line;
+  $n++;
+}
+print STDERR "[suf v5] tail done, $n lines\n";
+exit 0;
+PERL
+  local rc=$?
+  rm -f "$fifo"
+  return $rc
+}
+
+# 진행 중 job 취소. fifo unlink + (optional) sidecar 에 ESC.
+# suf_cancel <job> [--surface X]
+suf_cancel() {
+  [ $# -ge 1 ] || { printf 'usage: suf_cancel <job> [--surface X]\n' >&2; return 2; }
+  local job="$1" surface=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --surface) surface="$2"; shift 2 ;;
+      *) printf '[suf v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  local fifo esc_note=""
+  fifo="$(_suf_v5_fifo_path "$job")"
+  [ -p "$fifo" ] && rm -f "$fifo"
+  if [ -n "$surface" ]; then
+    cmux send-key --surface "$surface" Escape >/dev/null 2>&1 && esc_note=" + ESC sent"
+  fi
+  if [ "${SUF_V5_QUIET:-off}" != "on" ]; then
+    printf '[suf v5] cancel %s (fifo unlinked%s)\n' "$job" "$esc_note" >&2
+  fi
+}
+
 # v3 helper 유지 — 같은 workspace 의 다른 surface 목록
 suf_other_surfaces() {
   local tree workspace

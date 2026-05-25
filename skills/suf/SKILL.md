@@ -47,28 +47,52 @@ sidecar:          │
 
 ## 사용
 
+### 동기 (한 줄 ack)
+
 ```bash
 source ~/.agents/skills/suf/scripts/suf-v5-lib.sh
-
-# 자동 감지 + 모든 cap 강제
 ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")
 ANSWER=$(suf_ask surface:6 "git log -5 --oneline" --mode worker)
+ANSWER=$(suf_ask_unsafe surface:9 "$LONG" --prompt-max 4000 --response-max 65536 --timeout 180)
+```
 
-# 명시적 cap 우회 (호출자가 큰 응답 의도임을 선언)
-ANSWER=$(suf_ask_unsafe surface:9 "$LONG_PROMPT" \
-           --prompt-max 4000 --response-max 65536 --timeout 180)
+### 비동기 (long task, fire-and-collect)
 
-# 같은 workspace 의 다른 surface 목록 (v3 그대로)
-suf_other_surfaces
+```bash
+# 1) 송신만 — parent 즉시 자유. job_id stdout.
+job=$(suf_send surface:9 "build 끝나면 한 줄 요약")
+
+# 2-a) 나중에 blocking collect (timeout 길게)
+result=$(suf_collect "$job" --timeout 1800)
+
+# 2-b) non-blocking 체크 (polling 패턴)
+if suf_check "$job"; then result=$(suf_collect "$job"); fi
+
+# 2-c) 진척 stream (sidecar 가 한 writer 로 line 단위 print + close 패턴)
+suf_tail "$job" --timeout 600
+
+# 3) 도중 취소
+suf_cancel "$job" --surface surface:9   # fifo unlink + ESC 송신
+```
+
+### Discovery
+
+```bash
+suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제외)
 ```
 
 ## API
 
 | 함수 | 시그니처 | 비고 |
 |---|---|---|
-| `suf_ask` | `<surface> <prompt> [--mode llm\|worker] [--timeout N]` | cap 강제 |
-| `suf_ask_unsafe` | `<surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]` | escape valve |
-| `suf_other_surfaces` | 인자 없음 | 같은 ws 의 다른 surface (cross-ws 자동 제외) |
+| `suf_ask` | `<surface> <prompt> [--mode llm\|worker] [--timeout N]` | 동기. cap 강제 |
+| `suf_ask_unsafe` | `<surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]` | 동기. escape valve |
+| `suf_send` | `<surface> <prompt> [--mode]` | **비동기 송신**. stdout=job_id |
+| `suf_collect` | `<job> [--timeout N] [--response-max N]` | **비동기 수신**. blocking read |
+| `suf_check` | `<job>` | non-blocking probe. rc 0=ready, 1=not yet, 2=no job |
+| `suf_tail` | `<job> [--timeout N]` | line 단위 stream until EOF |
+| `suf_cancel` | `<job> [--surface X]` | fifo unlink + (optional) ESC 송신 |
+| `suf_other_surfaces` | 인자 없음 | 같은 ws 의 다른 surface |
 
 ### exit codes
 
@@ -79,6 +103,7 @@ suf_other_surfaces
 | 3 | sidecar 모드 auto-detect 실패 (`--mode` 명시 필요) |
 | 4 | mkfifo 실패 |
 | 5 | cmux send 실패 (surface 없음 등) |
+| 6 | no such job (suf_collect/check/tail 에서 fifo 없음) |
 | 124 | timeout (FIFO read 가 deadline 전에 종료 안 됨) |
 
 ## 환경변수
