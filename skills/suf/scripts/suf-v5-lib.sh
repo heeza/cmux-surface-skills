@@ -77,14 +77,14 @@ _suf_v5_detect() {
 
   # LLM 우선 매칭 (LLM 이 떠 있으면 shell 도 같이 있는 게 정상)
   if printf '%s' "$procs" \
-      | grep -qE '(^|/)(claude|codex|gemini|opencode|omc|omo|omx)( |$)'; then
+      | grep -qE '(^|/)(claude|codex|gemini|opencode|omc|omo|omx|agy|antigravity|junie)( |$)'; then
     echo llm; return 0
   fi
-  if printf '%s' "$procs" | grep -qiE '(anthropic|openai)'; then
+  if printf '%s' "$procs" | grep -qiE '(anthropic|openai|antigravity)'; then
     echo llm; return 0
   fi
   # claude/codex 의 node-launched 변형
-  if printf '%s' "$procs" | grep -qE 'node .*(claude|codex|gemini)'; then
+  if printf '%s' "$procs" | grep -qE 'node .*(claude|codex|gemini|agy|antigravity)'; then
     echo llm; return 0
   fi
   # 사용자 정의 — pi 같이 짧은 이름
@@ -135,8 +135,16 @@ _suf_v5_worker_prompt() {
 
 _suf_v5_send() {
   local surface="$1" full="$2"
+  # send 와 send-key 가 별개 RPC. 데몬 처리 race 로 Enter 가 본문보다 먼저
+  # 도착 / 휘발할 수 있어 짧은 stall + 재시도 패턴.
   cmux send --surface "$surface" -- "$full" >/dev/null 2>&1 || return 1
+  sleep "${SUF_V5_ENTER_DELAY:-0.15}"
   cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || return 1
+  # Enter 휘발 보험. 빈 라인 한 번 더 — sidecar 입력창에 무해.
+  if [ "${SUF_V5_ENTER_DOUBLE:-on}" = "on" ]; then
+    sleep 0.05
+    cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || true
+  fi
 }
 
 # blocking read with hard timeout (perl alarm) + byte cap.
