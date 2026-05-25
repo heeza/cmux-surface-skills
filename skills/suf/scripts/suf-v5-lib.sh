@@ -390,19 +390,39 @@ suf_collect() {
   return $rc
 }
 
-# non-blocking 체크. rc: 0=data ready, 1=not yet, 2=no such job.
-# suf_check <job>
+# non-blocking 체크. rc: 0=data ready, 1=not yet (or timed out), 2=no such job.
+# suf_check <job> [--wait N] [--poll-interval F]
+#   --wait N         : N초까지 폴링 후에도 안 도착이면 rc=1. 도착 즉시 rc=0.
+#   --poll-interval F: 폴링 주기 (기본 0.2s)
 suf_check() {
-  [ $# -ge 1 ] || { printf 'usage: suf_check <job>\n' >&2; return 2; }
+  [ $# -ge 1 ] || { printf 'usage: suf_check <job> [--wait N] [--poll-interval F]\n' >&2; return 2; }
+  local job="$1" wait_s=0 interval=0.2
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wait)          wait_s="$2"; shift 2 ;;
+      --poll-interval) interval="$2"; shift 2 ;;
+      *) printf '[suf v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
   local fifo
-  fifo="$(_suf_v5_fifo_path "$1")"
+  fifo="$(_suf_v5_fifo_path "$job")"
   [ -p "$fifo" ] || return 2
-  perl - "$fifo" <<'PERL'
+  perl - "$fifo" "$wait_s" "$interval" <<'PERL'
 use Fcntl qw(O_RDONLY O_NONBLOCK);
 use IO::Select;
-sysopen(my $fh, $ARGV[0], O_RDONLY | O_NONBLOCK) or exit 2;
-my $s = IO::Select->new($fh);
-exit ($s->can_read(0) ? 0 : 1);
+use Time::HiRes qw(time sleep);
+my ($fifo, $wait_s, $interval) = @ARGV;
+my $deadline = time + $wait_s;
+while (1) {
+  sysopen(my $fh, $fifo, O_RDONLY | O_NONBLOCK) or exit 2;
+  my $s = IO::Select->new($fh);
+  if ($s->can_read(0)) { close $fh; exit 0; }
+  close $fh;
+  last if time >= $deadline;
+  sleep $interval;
+}
+exit 1;
 PERL
 }
 
@@ -427,6 +447,9 @@ suf_tail() {
   fi
   perl - "$timeout" "$fifo" <<'PERL'
 my ($timeout, $fifo) = @ARGV;
+# stdout 즉시 flush — sidecar 가 line 한 줄 흘릴 때마다 화면에 보임 (true streaming).
+$| = 1;
+STDOUT->autoflush(1) if STDOUT->can("autoflush");
 $SIG{ALRM} = sub { print STDERR "[suf v5] tail timeout\n"; exit 124 };
 alarm $timeout;
 open(my $fh, "<", $fifo) or do { print STDERR "[suf v5] tail open fail: $!\n"; exit 5 };
@@ -435,6 +458,10 @@ while (defined(my $line = <$fh>)) {
   print $line;
   $n++;
 }
+alarm 0;
+close $fh;
+# stdout 완전 flush 보장 후 stderr done 메시지 — 표시 순서 직관적.
+STDOUT->flush() if STDOUT->can("flush");
 print STDERR "[suf v5] tail done, $n lines\n";
 exit 0;
 PERL

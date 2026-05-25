@@ -89,7 +89,7 @@ suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제�
 | `suf_ask_unsafe` | `<surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]` | 동기. escape valve |
 | `suf_send` | `<surface> <prompt> [--mode]` | **비동기 송신**. stdout=job_id |
 | `suf_collect` | `<job> [--timeout N] [--response-max N]` | **비동기 수신**. blocking read |
-| `suf_check` | `<job>` | non-blocking probe. rc 0=ready, 1=not yet, 2=no job |
+| `suf_check` | `<job> [--wait N] [--poll-interval F]` | non-blocking probe. rc 0=ready, 1=not yet, 2=no job. ⚠️ destructive race 가능 — 함정 섹션 참조 |
 | `suf_tail` | `<job> [--timeout N]` | line 단위 stream until EOF |
 | `suf_cancel` | `<job> [--surface X]` | fifo unlink + (optional) ESC 송신 |
 | `suf_other_surfaces` | 인자 없음 | 같은 ws 의 다른 surface |
@@ -152,6 +152,7 @@ suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제�
 - **sidecar 가 fifo write 실패** — TUI LLM 이 Bash 호출 못 했거나 거부. RC=124 timeout. 같은 JOB 재시도 X — fifo 가 이미 unlink 됨. 새 호출.
 - **self 에게 send** — 데드락. `suf_other_surfaces` 가 self 제외. surface 직접 지정 시 호출자 책임.
 - **`_unsafe` 의 토큰** — cap 풀어도 sidecar 가 큰 본문 생성 = 토큰 폭주. 진짜 의도적일 때만.
+- **`suf_check` destructive race** — nonblocking open + close 가 fifo writer 에 SIGPIPE 일으킬 수 있음. check rc=0 직후 collect 가 빈 응답 받는 경우 발생. 진짜 안전한 polling 은 `suf_collect --timeout <짧게>` — kernel blocking read 가 native polling, race 없음. check 는 가벼운 "writer 부착 여부" 신호 정도로만 사용.
 
 ## 디버깅
 

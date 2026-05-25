@@ -76,24 +76,45 @@ result=$(suf_collect "$job" --timeout 1800)
 - `--timeout 0` 은 즉시 timeout (= probe 와 동등하지만 sidecar 가 막 fifo write 시작한 경우 잘릴 위험. probe 는 `suf_check`)
 - `--response-max 65536` 으로 4KB 기본 cap 우회
 
-### 2.3 `suf_check <job>`
+### 2.3 `suf_check <job> [--wait N] [--poll-interval F]`
 
-non-blocking probe. fifo 안에 data 가 흐르기 시작했나 확인.
+non-blocking probe. fifo 의 writer 가 부착됐거나 data 가 흐르기 시작했나 확인.
 
 | RC | 의미 |
 |---|---|
-| 0 | data ready — `suf_collect` 호출 적기 |
-| 1 | 아직 안 도착 — 더 기다림 |
+| 0 | writer attached / data 있음 — collect 호출 적기 (단 race 주의) |
+| 1 | 아직 — 더 기다림. `--wait N` 으로 N초까지 자동 폴링 |
 | 2 | no such job — 잘못된 id 또는 이미 collect 됨 |
 
+옵션:
+- `--wait N` — N초까지 내부 폴링. ready 즉시 rc=0, 끝까지 안 오면 rc=1.
+- `--poll-interval F` — 폴링 주기 (기본 0.2s)
+
 ```bash
+# 명시적 loop
 job=$(suf_send surface:9 "오래 걸리는 작업")
-while ! suf_check "$job"; do
-  echo "기다리는 중..."
-  sleep 5
-done
+while ! suf_check "$job"; do sleep 5; done
 result=$(suf_collect "$job")
+
+# 단축형 (--wait 가 내부 폴링)
+job=$(suf_send surface:9 "오래 걸리는 작업")
+suf_check "$job" --wait 300 && result=$(suf_collect "$job")
 ```
+
+⚠️ **destructive race 위험**:
+
+`suf_check` 가 nonblocking O_RDONLY 로 fifo open → can_read 신호 잡음 → close. 이때 sidecar 의 writer 가 write 도중이면 **SIGPIPE 발생** 가능. 결과: check rc=0 인데 collect 가 빈 응답 받음.
+
+**진짜 안전한 polling 패턴** — `suf_collect` 자체가 native polling:
+
+```bash
+# 권장: collect 의 짧은 timeout 으로 직접 ready 확인 (kernel blocking read = native polling, race 없음)
+while ! result=$(suf_collect "$job" --timeout 5); do
+  echo "안 옴, 또 5초..."
+done
+```
+
+`suf_check` 는 "sidecar 가 작업 시작했나" 의 가벼운 신호 정도로만 — 진짜 데이터 안전 받기는 `suf_collect` 가 정답.
 
 ### 2.4 `suf_tail <job> [--timeout N]`
 
