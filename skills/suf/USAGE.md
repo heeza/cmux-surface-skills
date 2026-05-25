@@ -39,97 +39,197 @@ parent ◀───receive── sidecar       (suf_collect 시점, timeout 자�
 
 ---
 
-## 2. 함수별 상세
+## 2. 함수별 상세 (8종)
 
-### 2.1 `suf_send <surface> <prompt> [--mode llm|worker]`
+각 함수는 **무엇 / 언제 / 시그니처 / 출력 / 예제 / 주의** 6 블록.
 
-송신만. fifo 생성 + cmux send. 즉시 리턴.
+---
 
-| 출력 | 내용 |
-|---|---|
-| stdout | `job_id` (한 줄) |
-| stderr | `[suf v5] surface:9 (llm) sent, job=<id>` |
-| RC | 0 정상 / 2 cap or arg / 3 detect 실패 / 4 mkfifo / 5 cmux send 실패 |
+### 2.1 `suf_ask` — 동기 ask (가장 흔한 패턴)
 
+- **무엇** — 한 호출로 송신 + 응답까지. parent blocking. v3/v4 의 핵심 API 와 같은 모양.
+- **언제** — 짧은 ack/조회 (< 30초 예상). 99% 케이스. **default 첫 선택**.
+
+**시그니처**:
 ```bash
-job=$(suf_send surface:9 "test 결과 한 줄 요약")
-echo "job_id: $job"
-# job_id: 1779694440788107000-30226-3269f5b8
+suf_ask <surface> <prompt> [--mode llm|worker] [--timeout N]
 ```
 
-### 2.2 `suf_collect <job> [--timeout N] [--response-max N]`
+**출력**:
 
-fifo blocking read. timeout/사이즈 호출 시점에 자유롭게.
+| 채널 | 내용 |
+|---|---|
+| stdout | 응답 본문 |
+| stderr | `[suf v5] surface:9 (llm) 4s 18B ok` |
+| RC | 0 정상 / 2 cap 또는 인자 / 3 detect 실패 / 4 mkfifo / 5 send 실패 / 124 timeout |
 
-| 출력 | 내용 |
+**예제**:
+```bash
+ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")
+# main
+
+ANSWER=$(suf_ask surface:6 "date +%H:%M" --mode worker)
+# 16:34
+
+ANSWER=$(suf_ask surface:9 "test 결과 한 줄" --timeout 120)
+```
+
+**주의** — prompt > 500자 면 즉시 reject. `suf_ask_unsafe` 또는 `SUF_V5_PROMPT_MAX` env 우회.
+
+---
+
+### 2.2 `suf_ask_unsafe` — cap 우회 동기 ask
+
+- **무엇** — `suf_ask` 와 같지만 prompt/response cap 호출 시점에 자유. 호출자가 큰 작업 의도임을 명시.
+- **언제** — PR 리뷰, 분석 리포트, 진짜로 큰 응답 필요. **드물게**.
+
+**시그니처**:
+```bash
+suf_ask_unsafe <surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]
+```
+
+**출력** — `suf_ask` 와 동일.
+
+**예제**:
+```bash
+# 1KB prompt, 64KB 응답, 5분
+result=$(suf_ask_unsafe surface:9 "$LONG_PROMPT" \
+  --prompt-max 4000 --response-max 65536 --timeout 300)
+```
+
+**주의** — cap 풀어도 sidecar 가 큰 본문 생성 = 토큰 폭주. 함수 이름 자체에 `_unsafe` 박혀있는 이유 — git log / 코드 리뷰에서 의도적 호출 즉시 보임.
+
+---
+
+### 2.3 `suf_send` — 비동기 송신
+
+- **무엇** — fifo 생성 + cmux send 까지만. parent 즉시 리턴. job_id stdout.
+- **언제** — long task 위임 / parent 가 다른 일 병행 / multi-sidecar fan-in.
+
+**시그니처**:
+```bash
+suf_send <surface> <prompt> [--mode llm|worker]
+```
+
+**출력**:
+
+| 채널 | 내용 |
+|---|---|
+| stdout | job_id (한 줄, 변수에 capture) |
+| stderr | `[suf v5] surface:9 (llm) sent, job=<id>` |
+| RC | 0 정상 / 2 cap or arg / 3 detect 실패 / 4 mkfifo / 5 send 실패 |
+
+**예제**:
+```bash
+job=$(suf_send surface:9 "test 결과 한 줄")
+echo "job: $job"
+# 1779694440788107000-30226-3269f5b8
+
+# parent 다른 일 가능
+do_other_work
+
+# 나중에 결과 받기
+result=$(suf_collect "$job")
+```
+
+**주의** — `suf_send` 만 호출하고 `suf_collect`/`suf_cancel` 안 부르면 fifo 누수. `/tmp/suf-fifo/` 청소 필요.
+
+---
+
+### 2.4 `suf_collect` — 비동기 수신
+
+- **무엇** — fifo blocking read. 결과 stdout 출력 후 fifo unlink.
+- **언제** — `suf_send` 의 결과 받기. 짧은 timeout loop 으로 안전 polling 도.
+
+**시그니처**:
+```bash
+suf_collect <job> [--timeout N] [--response-max N]
+```
+
+**출력**:
+
+| 채널 | 내용 |
 |---|---|
 | stdout | 응답 본문 |
 | stderr | `[suf v5] collect <id> 12s 87B ok` |
 | RC | 0 정상 / 6 no such job / 124 timeout |
 
+**예제**:
 ```bash
+# 단순 blocking 대기 (30분까지)
 result=$(suf_collect "$job" --timeout 1800)
-# 30분까지 기다림
-```
 
-옵션:
-- `--timeout 0` 은 즉시 timeout (= probe 와 동등하지만 sidecar 가 막 fifo write 시작한 경우 잘릴 위험. probe 는 `suf_check`)
-- `--response-max 65536` 으로 4KB 기본 cap 우회
+# 큰 응답 받기
+log=$(suf_collect "$job" --response-max 65536 --timeout 600)
 
-### 2.3 `suf_check <job> [--wait N] [--poll-interval F]`
-
-non-blocking probe. fifo 의 writer 가 부착됐거나 data 가 흐르기 시작했나 확인.
-
-| RC | 의미 |
-|---|---|
-| 0 | writer attached / data 있음 — collect 호출 적기 (단 race 주의) |
-| 1 | 아직 — 더 기다림. `--wait N` 으로 N초까지 자동 폴링 |
-| 2 | no such job — 잘못된 id 또는 이미 collect 됨 |
-
-옵션:
-- `--wait N` — N초까지 내부 폴링. ready 즉시 rc=0, 끝까지 안 오면 rc=1.
-- `--poll-interval F` — 폴링 주기 (기본 0.2s)
-
-```bash
-# 명시적 loop
-job=$(suf_send surface:9 "오래 걸리는 작업")
-while ! suf_check "$job"; do sleep 5; done
-result=$(suf_collect "$job")
-
-# 단축형 (--wait 가 내부 폴링)
-job=$(suf_send surface:9 "오래 걸리는 작업")
-suf_check "$job" --wait 300 && result=$(suf_collect "$job")
-```
-
-⚠️ **destructive race 위험**:
-
-`suf_check` 가 nonblocking O_RDONLY 로 fifo open → can_read 신호 잡음 → close. 이때 sidecar 의 writer 가 write 도중이면 **SIGPIPE 발생** 가능. 결과: check rc=0 인데 collect 가 빈 응답 받음.
-
-**진짜 안전한 polling 패턴** — `suf_collect` 자체가 native polling:
-
-```bash
-# 권장: collect 의 짧은 timeout 으로 직접 ready 확인 (kernel blocking read = native polling, race 없음)
+# 안전한 polling (race 없는 native pattern)
 while ! result=$(suf_collect "$job" --timeout 5); do
-  echo "안 옴, 또 5초..."
+  echo "안 옴, 다시 대기..."
 done
 ```
 
-`suf_check` 는 "sidecar 가 작업 시작했나" 의 가벼운 신호 정도로만 — 진짜 데이터 안전 받기는 `suf_collect` 가 정답.
+**주의** — 같은 job 두 번 collect 못 함 (fifo unlink). RC=6 발생 시 잘못된 id 또는 이미 받은 거.
 
-### 2.4 `suf_tail <job> [--timeout N]`
+---
 
-line 단위 stream until EOF. sidecar 가 진척 line 흘릴 때 실시간 표시.
+### 2.5 `suf_check` — non-blocking probe (with polling)
 
-| 출력 | 내용 |
+- **무엇** — fifo 의 writer 부착 / data 흐름 시작 여부 확인. polling 옵션 포함.
+- **언제** — 가벼운 "작업 시작했나" 신호. **진짜 데이터 안전 수신은 `suf_collect` 권장**.
+
+**시그니처**:
+```bash
+suf_check <job> [--wait N] [--poll-interval F]
+```
+
+**출력**:
+
+| RC | 의미 |
 |---|---|
-| stdout | 매 line raw |
-| stderr | `[suf v5] tail done, 23 lines` |
+| 0 | writer attached or data 있음 |
+| 1 | 아직 (또는 `--wait N` deadline 초과) |
+| 2 | no such job (잘못된 id 또는 이미 collect 됨) |
+
+옵션:
+- `--wait N` — N초까지 내부 폴링. ready 즉시 rc=0.
+- `--poll-interval F` — 폴링 주기 (기본 0.2s).
+
+**예제**:
+```bash
+# 즉시 probe
+suf_check "$job"; echo $?   # 1 또는 0
+
+# 5분까지 자동 폴링
+suf_check "$job" --wait 300 && result=$(suf_collect "$job")
+```
+
+**주의** — ⚠️ **destructive race**: check 가 nonblocking open + close 사이에 sidecar 의 writer 가 write 시작 중이면 SIGPIPE → collect 가 빈 응답 받는 케이스 발생. **진짜 안전한 폴링은 `suf_collect --timeout 5` 자체** (kernel blocking read 이 native polling, race 없음).
+
+---
+
+### 2.6 `suf_tail` — 진척 line stream
+
+- **무엇** — fifo 의 writer 가 line 단위로 보내는 출력을 실시간 stdout 으로 stream.
+- **언제** — build/deploy/test 진척 로그를 sidecar 에서 실시간 받기.
+
+**시그니처**:
+```bash
+suf_tail <job> [--timeout N]
+```
+
+**출력**:
+
+| 채널 | 내용 |
+|---|---|
+| stdout | 매 line raw (autoflush) |
+| stderr | (끝났을 때) `[suf v5] tail done, 23 lines` |
 | RC | 0 정상 EOF / 124 timeout / 5 open 실패 / 6 no such job |
 
-**중요**: sidecar 가 **한 writer 로 line print + 마지막에 close** 해야 진척 stream 됨. `echo X >> $fifo` 반복은 매번 EOF — 한 줄만 받고 끝남.
+**예제** (sidecar 가 진척 흘려야 작동):
 
-올바른 sidecar 패턴 (LLM Bash tool):
+sidecar 쪽 패턴:
 ```bash
+# Bash tool 한 호출로 묶음. >> append 아니라 > truncate + 한 writer.
 {
   echo "[1/4] cloning..."
   git clone ...
@@ -141,25 +241,90 @@ line 단위 stream until EOF. sidecar 가 진척 line 흘릴 때 실시간 표�
 } > /tmp/suf-fifo/<job>.res
 ```
 
-parent:
+parent 쪽:
 ```bash
-job=$(suf_send surface:9 "위 build 진척 line 단위로")
-suf_tail "$job" --timeout 600
-# 각 line 실시간 출력
+job=$(suf_send surface:9 "위 4단계 progress 흘려라")
+suf_tail "$job" --timeout 600 | tee build.log
+# 라인마다 즉시 화면 + log 파일
 ```
 
-### 2.5 `suf_cancel <job> [--surface X]`
+**주의** — sidecar 가 `echo line >> $fifo` 반복하면 매번 EOF — tail 첫 줄만 받고 종료. **반드시 한 writer 로 묶어야** stream 작동.
 
-진행 중 job 취소. fifo unlink → parent 의 collect/tail 이 즉시 깨어남 (open fail rc=5). `--surface` 지정 시 sidecar 에 ESC 송신.
+---
 
+### 2.7 `suf_cancel` — 진행 중 job 취소
+
+- **무엇** — fifo unlink (parent 측 정리) + optional sidecar 에 ESC 키 송신.
+- **언제** — long task 도중 사용자 의지로 끊기 / timeout fallback / 잘못 보낸 job 회수.
+
+**시그니처**:
 ```bash
+suf_cancel <job> [--surface X]
+```
+
+**출력**:
+
+| 채널 | 내용 |
+|---|---|
+| stderr | `[suf v5] cancel <id> (fifo unlinked + ESC sent)` |
+| RC | 0 |
+
+**예제**:
+```bash
+# parent 측만 정리 (sidecar 작업은 계속)
+suf_cancel "$job"
+
+# sidecar 작업도 끊기 시도 (ESC)
 suf_cancel "$job" --surface surface:9
-# fifo unlinked + surface:9 에 ESC
+
+# timeout 후 fallback 패턴
+if ! result=$(suf_collect "$job" --timeout 60); then
+  suf_cancel "$job" --surface surface:9
+  # 다른 sidecar 로 재시도
+fi
 ```
 
-ESC 가 sidecar 작업을 멈출지는 sidecar 종류에 따름:
+**주의** — ESC 가 sidecar 작업을 진짜 끊을지는 종류 따라 다름:
 - Claude/Codex/Gemini TUI: 일반적으로 멈춤
-- shell worker: ctrl-c 가 더 효과. `cmux send-key --surface X 'C-c'` 직접 호출 가능 (suf_cancel 은 ESC 만)
+- shell worker: ctrl-c 가 더 효과. `cmux send-key --surface X 'C-c'` 직접 가능 (suf_cancel 은 ESC 만)
+
+---
+
+### 2.8 `suf_other_surfaces` — discovery
+
+- **무엇** — 같은 workspace 의 self 가 아닌 다른 surface 목록 (cross-workspace 자동 제외).
+- **언제** — 자동 sidecar 선택 / 사용 가능한 surface 확인 / 충돌 회피.
+
+**시그니처**:
+```bash
+suf_other_surfaces
+```
+
+**출력**:
+
+| 채널 | 내용 |
+|---|---|
+| stdout | surface ref 한 줄씩 (`surface:9` 등) |
+| RC | 0 정상 / 1 cmux tree 실패 또는 workspace 못 찾음 |
+
+**예제**:
+```bash
+suf_other_surfaces
+# surface:9
+# surface:11
+# surface:13
+
+# 첫 번째 surface 자동 선택
+target=$(suf_other_surfaces | head -1)
+suf_ask "$target" "ping"
+
+# 모두에 동시 ping (fan-out)
+for s in $(suf_other_surfaces); do
+  suf_send "$s" "현황 한 줄"
+done
+```
+
+**주의** — cross-workspace 의도된 미지원. 다른 ws 의 surface 가 필요하면 그 ws 의 cmux send 직접 호출 (lib 우회).
 
 ---
 
