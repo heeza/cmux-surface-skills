@@ -1,165 +1,133 @@
 ---
 name: suf
-description: cmux sidecar 와 마커 + read-screen 폴링으로 통신하는 agent-to-agent 프로토콜. 옆 패널의 Claude/Codex/agy/shell 에 메시지를 보내고 결과를 받아오기. "/suf", "옆 surface 에 물어봐", "sidecar 와 통신" 트리거. surface 생성 자체는 cmux 스킬, 그 위의 통신 사이클(send → poll → extract)이 suf.
+description: cmux sidecar 사이의 agent-to-agent 통신. v5 부터 FIFO 응답 채널 + cap-discipline + sidecar 자동 감지 (LLM | shell worker). 짧은 ack/조회/단일 명령 위임에만 사용. 큰 작업 위임 금지 — 토큰 폭주.
 ---
 
-# suf — agent ↔ agent 통신
+# suf v5 — disciplined sidecar talk
 
-## 두 가지 모드
+## 핵심 변경 (v3/v4 → v5)
 
-| 모드 | 용도 | 채널 | 응답 길이 |
-|---|---|---|---|
-| **inline** (`suf_ask`) | 짧은 텍스트 ack/요약 | screen scrollback | ~수천 줄 (cap) |
-| **file** (`suf_ask_file`) | 대용량 본문 (JSON, 로그, 코드, 문서) | `/tmp/suf-spool/<job>.out` + screen 으로 path/size/sha256 | 제한 없음 |
+| 항목 | v3/v4 | v5 |
+|---|---|---|
+| 응답 채널 | `read-screen` 폴링 + 마커 추출 | **per-job FIFO blocking read** |
+| 채널 noise | ANSI / single-line marker / scrollback 한계 | 0 — kernel pipe 직통 |
+| sidecar 정체 | 사용자가 알아서 | **자동 감지** (LLM vs worker) |
+| token discipline | 없음 | **4종 cap** (prompt/response/timeout/auto-cap 문구) |
+| escape valve | — | `suf_ask_unsafe` 명시적 opt-in |
 
-기본은 inline. body 가 클 것 같으면 file 모드. 둘 다 마커 프로토콜은 동일.
+## 언제 쓰나 (그리고 안 쓰나)
 
-## 한 사이클 (v3, inline)
+✅ **쓰는 경우**
+- 다른 surface 의 짧은 ack / pong / 상태 한 줄
+- 단일 shell command 위임 (worker mode) — git/ls/date 같은 한 줄
+- yes/no 결정 위임
+
+❌ **절대 쓰지 마라**
+- "리포트 작성", "분석", "수천 단어 분량" — sidecar 가 본인 토큰으로 폭주
+- "가상 메시지 N개 생성 (N≥10)"
+- "긴 코드 / 문서 / 설계" — file 모드도 토큰 절약 아님
+- 큰 작업이면 **parent (self) 가 직접 처리**가 항상 더 쌈
+
+## 한 사이클
 
 ```
-say → poll-extract → grace → re-extract
+parent: suf_ask <surface> <prompt>
+  ├─ 1) prompt cap 검사 (≤500자 default)
+  ├─ 2) 모드 자동 감지: ps → "llm" | "worker" | "unknown"
+  ├─ 3) JOB id 생성, /tmp/suf-fifo/<JOB>.res mkfifo
+  ├─ 4) prompt + 모드별 auto-cap 문구 첨부
+  ├─ 5) cmux send (PTY 입력창) + Enter
+  └─ 6) perl alarm + sysread 로 FIFO blocking read
+        (timeout 30s default, max 4KB)
+                  ▲
+sidecar:          │
+  llm:    답 작성 → Bash: printf "..." > /tmp/suf-fifo/<JOB>.res
+  worker: { command ; } > /tmp/suf-fifo/<JOB>.res 2>&1
 ```
 
-`suf_ask` 한 줄이 모두 포함. 분리 호출 안 함.
+## 사용
 
-- **say**: `cmux send` + `send-key Enter` 로 본문 + 마커 송신.
-- **poll-extract**: `read-screen --scrollback --lines 8000` 으로 surface buffer 전체를 dump 받아 **닫힌 ANSWER..END pair ≥ 2** 면 마지막 pair 반환 (0.5초 폴링).
-- **grace**: sidecar 가 마커 닫고 추가 출력 중일 수 있어 0.5초 대기 후 한 번 더 추출.
+```bash
+source ~/.agents/skills/suf/scripts/suf-v5-lib.sh
 
-surface 가 새로 필요하면 앞에 `cmux new-split`, 부모가 만든 sidecar 면 마지막에 `cmux close-surface`.
+# 자동 감지 + 모든 cap 강제
+ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")
+ANSWER=$(suf_ask surface:6 "git log -5 --oneline" --mode worker)
 
-## 왜 polling 인가 (그리고 왜 pipe-pane 이 안 되는가)
+# 명시적 cap 우회 (호출자가 큰 응답 의도임을 선언)
+ANSWER=$(suf_ask_unsafe surface:9 "$LONG_PROMPT" \
+           --prompt-max 4000 --response-max 65536 --timeout 180)
 
-검토했지만 채택 안 한 채널:
+# 같은 workspace 의 다른 surface 목록 (v3 그대로)
+suf_other_surfaces
+```
 
-| 채널 | 왜 안 쓰는가 |
+## API
+
+| 함수 | 시그니처 | 비고 |
+|---|---|---|
+| `suf_ask` | `<surface> <prompt> [--mode llm\|worker] [--timeout N]` | cap 강제 |
+| `suf_ask_unsafe` | `<surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]` | escape valve |
+| `suf_other_surfaces` | 인자 없음 | 같은 ws 의 다른 surface (cross-ws 자동 제외) |
+
+### exit codes
+
+| RC | 의미 |
 |---|---|
-| `cmux pipe-pane --command` | terminal stdout stream 만 받음. Claude/Codex 같은 **TUI 는 chat history 를 ANSI cursor-rewrite 로 그리므로 stream 우회**. 1239줄 캡처돼도 마커 0회 잡힘. |
-| `cmux wait-for -S <name>` | sidecar 가 답변 후 별도 signal 명령을 호출 안 하면 영원히 블록. LLM 누락 위험. |
-| `cmux events --name <output>` | surface scrollback 변화 자체에 대한 event 발행 없음. agent hook/feed 위주, payload redacted. |
+| 0 | 성공 (응답 stdout) |
+| 2 | prompt cap 초과 / 잘못된 인자 / 잘못된 mode |
+| 3 | sidecar 모드 auto-detect 실패 (`--mode` 명시 필요) |
+| 4 | mkfifo 실패 |
+| 5 | cmux send 실패 (surface 없음 등) |
+| 124 | timeout (FIFO read 가 deadline 전에 종료 안 됨) |
 
-`read-screen` 은 surface 의 **rendered buffer** 를 dump 받기 때문에 cursor-rewrite 결과까지 보임. 유일하게 TUI 호환.
+## 환경변수
 
-## 송수신 종단의 pair 카운팅
+| 변수 | 기본값 | 의미 |
+|---|---|---|
+| `SUF_V5_PROMPT_MAX` | 500 | prompt 글자 cap |
+| `SUF_V5_RESPONSE_MAX` | 4096 | 응답 바이트 cap |
+| `SUF_V5_TIMEOUT` | 30 | blocking read 초 |
+| `SUF_V5_AUTO_CAP` | on | prompt 끝에 안내문 자동 첨부 (`off` 로 끔) |
+| `SUF_V5_FIFO_DIR` | `/tmp/suf-fifo` | FIFO 디렉토리 (mode 0700) |
 
-`cmux send` 후 prompt 가 surface 의 입력 chip 영역에 표시되는데, 거기에 마커 + placeholder `(여기에 답변 본문)` 까지 그대로 echo 된다. 즉:
-- **send 직후**: closed pair 1개 (echo, body = placeholder)
-- **sidecar 응답 완료**: closed pair 2개 (echo + 진짜 답변)
+## 자동 감지 (LLM vs worker)
 
-`suf_ask` 는 `pairs ≥ 2` 가 되면 **마지막 pair** 반환. echo 가 첫 번째라 자동으로 진짜 답변이 추출됨.
+`cmux tree` 의 tty → `ps -ww -t <tty> -o args=` 의 process list 매칭:
 
-## 마커
+- **LLM**: claude / codex / gemini / opencode / pi / omc / omo / omx — 이름 또는 argv. anthropic / openai / node-launched 변형 포함
+- **Worker**: zsh / bash / sh / fish / dash / ksh / tcsh
+- **Unknown** → `suf_ask` reject. `--mode` 로 명시 override
 
-`<<<SUF_ANSWER:$JOB>>>` ... `<<<SUF_END:$JOB>>>`
+화이트리스트 추가는 `_suf_v5_detect` 함수의 grep 패턴에.
 
-JOB = `nanosecond timestamp - PID - urandom4hex` — 동시 호출 / 같은 ns 충돌 방지 (v3 에서 random hex 추가).
+## 한계
 
-## 권장 사용 — 헬퍼 한 줄
+- **cross-workspace 미지원** — `cmux send --surface` 가 ref 만 받으므로 현재 workspace 안에서만. (의도된 설계: 다른 ws 의 surface 는 보통 사용자가 사용 중이므로 침범 금지)
+- **사용자가 직접 쓰는 sidecar surface 에 worker mode 보내면 입력 충돌** — sidecar 가 사용자 입력 중일 때 cmux send 가 키스트로크로 끼어듦. worker 모드는 사용자 안 보는 surface 에서만.
+- **LLM sidecar 가 bypass-permission 모드 아니면 Bash tool 확인 필요** — 그 경우 fifo write 못 함 → timeout. sidecar 의 `--dangerously-skip-permissions` 류 모드 가정.
+- **응답 4KB 이상은 truncate** — `suf_ask_unsafe --response-max` 로만 풀림.
 
-```bash
-source ~/.agents/skills/suf/scripts/suf-lib.sh
-ANSWER=$(suf_ask surface:22 "현황 보고")
-```
+## 함정 (v5 도 유효)
 
-| 함수 | 역할 |
+- **큰 prompt 보내지 마라** — 자동 reject 되어도 호출자가 그걸 우회하려고 `_unsafe` 쓰는 게 능사 아님. self 가 직접 처리 검토.
+- **sidecar 가 fifo write 실패** — TUI LLM 이 Bash 호출 못 했거나 거부. RC=124 timeout. 같은 JOB 재시도 X — fifo 가 이미 unlink 됨. 새 호출.
+- **self 에게 send** — 데드락. `suf_other_surfaces` 가 self 제외. surface 직접 지정 시 호출자 책임.
+- **`_unsafe` 의 토큰** — cap 풀어도 sidecar 가 큰 본문 생성 = 토큰 폭주. 진짜 의도적일 때만.
+
+## 디버깅
+
+- `_suf_v5_detect surface:N` 호출해서 모드 확인 가능 (private 이지만 source 후 호출됨)
+- `SUF_V5_AUTO_CAP=off` 로 안내문 제거하면 sidecar 에 보내는 진짜 prompt 확인 가능
+- FIFO 누수 확인: `ls -la /tmp/suf-fifo/`. 정상 종료 시 빈 디렉토리
+
+## v3/v4 마이그레이션
+
+| v3/v4 호출 | v5 대응 |
 |---|---|
-| `suf_ask <surface> <prompt> [timeout]` | inline: **say + poll + extract 한 번에**. 99% 이것만. |
-| `suf_ask_file <surface> <prompt> [timeout]` | file 모드: sidecar 답변을 spool 파일로 받음. **절대 경로 반환**. 호출자가 cat / 삭제. |
-| `suf_send_file <surface> <local-path> <prompt> [timeout]` | parent → sidecar 로 큰 입력 전달. spool 에 복사 후 path+sha 알려주고 inline 답변 수신. |
-| `suf_cleanup_spool [<job>]` | spool 정리. 인자 없으면 24h+ 묵은 것 삭제. |
-| `suf_say <surface> <prompt>` | 송신만, JOB 반환 (fire-and-forget) |
-| `suf_wait <surface> <job> [timeout]` | 닫힌 pair ≥ 2 까지 폴링 |
-| `suf_hear <surface> <job>` | 즉시 추출 (대기 없음) |
-| `suf_other_surfaces` | self 가 속한 워크스페이스의 다른 surface 목록 |
+| `suf_ask <surface> <prompt> [timeout]` | `suf_ask <surface> <prompt> [--timeout N]` (timeout 인자 위치 변경) |
+| `suf_ask_file` | `suf_ask_unsafe --response-max N` 로 통합 (별도 spool 채널 폐기) |
+| `suf_send_file` | parent 가 직접 sidecar 의 cwd 에 파일 두고 path 만 inline 전달 권장 |
+| `suf_say / suf_wait / suf_hear` | v5 는 단발 blocking. 분리 호출 없음. 비동기 필요하면 v3 fallback |
 
-환경변수:
-- `SUF_POLL_INTERVAL` (기본 0.5초) — 폴링 주기
-- `SUF_GRACE` (기본 0.5초) — wait 성공 후 extract 전 안정화 대기
-- `SUF_READ_LINES` (기본 8000) — read-screen scrollback 라인 수. inline 모드에서만 의미 있음.
-- `SUF_SPOOL_DIR` (기본 `/tmp/suf-spool`) — file 모드 spool 위치. mode 0700 으로 자동 생성.
-
-인라인으로 직접 짤 일이 생기면, sidecar 프롬프트는 다음 골격을 따른다:
-
-```
-<USER_TASK>
-
-답변은 반드시 아래 두 마커 사이에만 작성:
-<<<SUF_ANSWER:$JOB>>>
-(답변 본문)
-<<<SUF_END:$JOB>>>
-```
-
-별도 ack 명령 불필요 — sidecar 가 마커 사이에 답만 쓰면 끝.
-
-## file 모드 디테일
-
-```bash
-source ~/.agents/skills/suf/scripts/suf-lib.sh
-
-# 대용량 답변 받기
-path=$(suf_ask_file surface:22 "전체 로그 줘") || exit 1
-wc -l "$path"; head -100 "$path"
-rm -f "$path"
-
-# 대용량 입력 보내기
-text_answer=$(suf_send_file surface:22 ./big-input.json "이거 분석해줘")
-```
-
-### 마커 안 페이로드 (file 모드)
-
-```
-<<<SUF_ANSWER:$job>>>
-SUF_FILE: /tmp/suf-spool/<job>.out
-SUF_SIZE: 12345
-SUF_SHA256: abc123...
-<<<SUF_END:$job>>>
-```
-
-parent 측 검증: 파일 존재 → `wc -c` 와 `SUF_SIZE` 일치 → `shasum -a 256` 와 `SUF_SHA256` 일치. 어느 하나 어긋나면 exit 코드 2/3/4 로 실패.
-
-### sidecar 가 받는 instruction
-
-`suf_ask_file` 은 prompt 끝에 **shell 한 줄 그대로 복붙 가능한 템플릿**을 붙임:
-
-```bash
-cat > /tmp/suf-spool/<job>.out.tmp <<'EOF_SUF_BODY'
-(여기에 답변 본문)
-EOF_SUF_BODY
-mv ...tmp ...out && \
-  printf '<<<SUF_ANSWER:%s>>>\nSUF_FILE: %s\nSUF_SIZE: %s\nSUF_SHA256: %s\n<<<SUF_END:%s>>>\n' ...
-```
-
-sidecar 가 Claude/Codex 라면 Bash 툴로 실행. 일반 shell 이면 그대로 paste. atomic rename 으로 parent 가 부분쓰기 파일을 잡는 race 방지.
-
-## v1 → v4 개선점 요약
-
-| 항목 | v1 | v3 | v4 |
-|---|---|---|---|
-| 매칭 모델 | END 횟수 ≥ 2 (열린 END 도 카운트) | **닫힌 ANSWER..END pair ≥ 2** | (v3 유지) |
-| scrollback 한계 | 4000줄 | 8000줄 (`SUF_READ_LINES`) | inline 은 동일, **file 모드는 무관** |
-| polling 주기 | 1초 | 0.5초 | (v3 유지) |
-| job 충돌 | `ns-PID` | `ns-PID-urandom4hex` | (v3 유지) |
-| 대용량 payload | screen cap 에 묶임 | 동일 | **`/tmp/suf-spool/` 파일 채널 + size+sha256 검증** |
-| input 대용량 | 입력창 길이 의존 | 동일 | **`suf_send_file` 로 file path 전달** |
-
-## 함정
-
-- **send-key Enter 누락** — 입력만 들어가고 실행 안 됨. `suf_say` 가 자동 처리.
-- **self 에게 send** — 데드락. `suf_other_surfaces` / `$CMUX_SURFACE_ID` 로 self 배제. 같은 함수가 **다른 워크스페이스의 surface 도 자동 제외**한다.
-- **사용자 surface 를 close** — 금지. 부모가 만든 sidecar 만 정리.
-- **sidecar 가 마커 빠뜨림** — closed pair 1개 (echo) 에서 멈춰 timeout. 프롬프트에 마커 사용 지시가 명확해야 함.
-- **응답 매우 길어 scrollback 밖으로 밀림** — inline 의 본질적 한계. **`suf_ask_file` 로 전환**. `SUF_READ_LINES=20000` 식 임시 조치도 가능하지만 파일 모드가 정답.
-- **TUI 가 아닌 일반 shell** — pair 카운팅 동일하게 작동. shell echo 가 raw text 라 closed pair 1 + 응답 1 = 2 로 자연 일치.
-- **file 모드에서 sidecar 가 본문을 inline 으로 출력** — SUF_FILE 라인 없는 pair 라 timeout. prompt 가 충분히 명확해도 일부 sidecar 가 file write 거부할 수 있음. 그 경우 `suf_ask` 로 대체.
-- **size/sha256 mismatch (exit 3/4)** — sidecar 가 mv 전에 메타를 계산했거나 파일이 중간에 덮어쓰임. 같은 JOB 재시도하지 말고 새 JOB 으로 다시 호출.
-- **spool 누수** — file 모드 호출자가 명시적으로 `rm` 안 하면 24h 후 `suf_cleanup_spool` 이 청소. 민감 데이터면 호출 직후 삭제.
-
-## 확장 — fan-in / 진척 보고
-
-다중 sidecar 동시 처리나 중간 진척 알림이 필요하면 `cmux events --category notification` + sidecar 의 `cmux notify` 결합. 단순 1:1 ask 엔 불필요.
-
-## 안 쓰는 경우
-
-- 패널만 열면 충분 → cmux 스킬
-- 응답을 사용자가 직접 보면 되는 경우 → ack 불필요
-- ack 불가능한 TUI (vim, k9s, btop) — 마커 echo 자체가 안 되므로 화면 안정 감지 fallback 필요
+기존 `suf-lib.sh` (v3) 는 `scripts/` 안에 그대로 두므로 호환 필요한 호출자는 그쪽 source.
