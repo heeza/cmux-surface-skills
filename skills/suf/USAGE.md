@@ -39,6 +39,52 @@ parent ◀───receive── sidecar       (suf_collect 시점, timeout 자�
 
 ---
 
+## 1.5. 함수 선택 가이드 (한눈에)
+
+상황별 권장 함수.
+
+| 상황 | 함수 | 이유 |
+|---|---|---|
+| 30초 안 답 받을 짧은 ack/조회 | **`suf_ask`** | 가장 단순. blocking 한 번 |
+| 큰 prompt / 큰 응답 의도적으로 | `suf_ask_unsafe` | cap 우회. 의도 명시 |
+| 5분 ~ 1시간 long task | **`suf_send` + `suf_collect`** | parent blocking 분리 |
+| 여러 sidecar 동시 굴림 (fan-in) | `suf_send` ×N → `suf_collect` ×N | 병렬 |
+| 진척 로그 실시간으로 봐야 함 | **`suf_tail`** | line 단위 즉시 표시 |
+| 사이드카 작업 시작했나 가벼운 확인 | `suf_check` (조심) | ⚠️ race — collect short timeout 권장 |
+| 안전한 polling (race 없이 대기) | `suf_collect --timeout 5` 반복 | kernel blocking = native polling |
+| 진행 중 작업 중단 | `suf_cancel` | fifo unlink + 옵션 ESC |
+| 어느 surface 에 보낼지 자동 선택 | `suf_other_surfaces` | discovery |
+
+### "ask vs send/collect" 빠른 결정
+
+```
+30초 안에 끝남? ──── yes ──▶ suf_ask
+       │
+       no
+       │
+       ▼
+parent 가 사이에 다른 일 함? ── no ──▶ suf_ask --timeout N 길게
+       │
+       yes
+       │
+       ▼
+suf_send + suf_collect
+```
+
+### "collect vs tail" 빠른 결정
+
+```
+진척을 실시간으로 봐야 함? ── yes ──▶ suf_tail
+                                      (sidecar 가 한 writer 로 line print 필요)
+       │
+       no (결과만 한 번)
+       │
+       ▼
+suf_collect
+```
+
+---
+
 ## 2. 함수별 상세 (8종)
 
 각 함수는 **무엇 / 언제 / 시그니처 / 출력 / 예제 / 주의** 6 블록.
@@ -104,7 +150,14 @@ result=$(suf_ask_unsafe surface:9 "$LONG_PROMPT" \
 ### 2.3 `suf_send` — 비동기 송신
 
 - **무엇** — fifo 생성 + cmux send 까지만. parent 즉시 리턴. job_id stdout.
-- **언제** — long task 위임 / parent 가 다른 일 병행 / multi-sidecar fan-in.
+- **언제** — 다음 4가지 케이스. 그 외엔 `suf_ask` 가 더 간단.
+
+| 케이스 | 설명 |
+|---|---|
+| ① long task 위임 | 5분~1시간 작업. `suf_ask` 의 30초 default 로는 timeout. |
+| ② parent 가 사이에 다른 일 | send 즉시 리턴 → parent 가 코드 짜고/파일 읽고/다른 sidecar 호출 가능. |
+| ③ multi-sidecar 병렬 | 3 sidecar 동시 굴림 — N×`suf_send` → N×`suf_collect`. 직렬 대비 N배 빠름. |
+| ④ 진척 stream | `suf_send` → `suf_tail` 콤보. tail 은 fifo 가 이미 있어야 작동. |
 
 **시그니처**:
 ```bash
@@ -139,7 +192,16 @@ result=$(suf_collect "$job")
 ### 2.4 `suf_collect` — 비동기 수신
 
 - **무엇** — fifo blocking read. 결과 stdout 출력 후 fifo unlink.
-- **언제** — `suf_send` 의 결과 받기. 짧은 timeout loop 으로 안전 polling 도.
+- **언제** — `suf_send` 와 짝. 다음 4 시나리오.
+
+| 케이스 | 설명 |
+|---|---|
+| ① long task 결과 받기 | send 후 30분까지 기다림. `--timeout 1800`. |
+| ② fan-in 종합 | N 송신 → N collect. 마지막에 self 가 결과 종합. |
+| ③ 안전한 polling (race 없음) | `while ! result=$(suf_collect "$job" --timeout 5); do :; done` — kernel blocking read 가 native, `suf_check` 의 race 없음. |
+| ④ timeout 후 fallback | rc=124 시 다른 sidecar 로 재시도. |
+
+**`suf_ask` 와의 차이**: `suf_ask` = send + collect 한 번. collect 단독 = 이미 send 된 job 의 결과만. parent 가 send 와 collect 사이에 자유롭게 다른 일 가능.
 
 **시그니처**:
 ```bash
@@ -209,8 +271,16 @@ suf_check "$job" --wait 300 && result=$(suf_collect "$job")
 
 ### 2.6 `suf_tail` — 진척 line stream
 
-- **무엇** — fifo 의 writer 가 line 단위로 보내는 출력을 실시간 stdout 으로 stream.
-- **언제** — build/deploy/test 진척 로그를 sidecar 에서 실시간 받기.
+- **무엇** — fifo 의 writer 가 line 단위로 보내는 출력을 실시간 stdout 으로 stream (autoflush 적용).
+- **언제** — 다음 3 케이스. **결과만 필요하면 `suf_collect` 가 더 단순**.
+
+| 케이스 | 설명 |
+|---|---|
+| ① 진척 단계별 확인 | build/deploy/test 의 단계별 메시지 ("[1/4] cloning...", "[2/4] installing..."). collect 면 끝까지 0byte 보이다 한꺼번에 dump. |
+| ② 흐름 보고 도중 cancel | 이상한 line 보이면 사용자가 `suf_cancel` 결정. |
+| ③ `tee` 로 log 동시 저장 | `suf_tail "$job" \| tee build.log` — 화면 + 파일 동시. |
+
+**`suf_collect` 와의 차이**: collect 는 EOF 후 한꺼번에 stdout. tail 은 line 도착 즉시 stdout. **`suf_tail` 은 sidecar 가 한 writer 로 line print + close 패턴 따라야 작동** — `echo >> $fifo` 반복 시 매 line 마다 EOF 라 첫 줄만 받고 종료. 안 따르면 collect 가 더 안전.
 
 **시그니처**:
 ```bash
