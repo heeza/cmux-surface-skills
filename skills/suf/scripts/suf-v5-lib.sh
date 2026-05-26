@@ -111,12 +111,11 @@ _suf_v5_llm_prompt() {
     cat <<EOF
 $body
 
-[suf v5 규칙]
-- 답변 50토큰 (≈200자) 이내. 길면 자동 truncate.
-- 추가 정보 수집·도구 호출 금지. 이 한 턴에 답 + 한 줄 명령만.
-- 답 작성 후 마지막 도구 호출로 다음 한 줄 실행 (Bash tool):
-    printf '%s' "<답변_본문>" > $fifo
-- 본문은 fifo 에만. 화면에 길게 출력하지 말 것.
+[규칙]
+- 답변은 caveman 스킬사용해서 답변할것
+- 답 작성 후 마지막 도구 호출로 다음 실행 (Bash tool):
+  printf '%s' "<답변_본문>" > $fifo
+- 본문은 fifo 에만작성
 EOF
   else
     printf '%s\n' "$body"
@@ -491,6 +490,20 @@ suf_cancel() {
   if [ "${SUF_V5_QUIET:-off}" != "on" ]; then
     printf '[suf v5] cancel %s (fifo unlinked%s)\n' "$job" "$esc_note" >&2
   fi
+}
+
+# suf_by_title <title> <prompt> [--mode llm|worker] [--timeout N]
+#   title 로 surface 찾아 suf_ask 위임. 다중 매치 시 첫 번째.
+suf_by_title() {
+  [ $# -ge 2 ] || { printf 'usage: suf_by_title <title> <prompt> [opts]\n' >&2; return 2; }
+  local title="$1" prompt="$2"; shift 2
+  local ref
+  ref="$(cmux tree --all 2>/dev/null \
+    | grep -F "\"$title\"" \
+    | grep -oE 'surface:[0-9]+' \
+    | head -1)"
+  [ -n "$ref" ] || { printf '[suf v5] no surface titled %s\n' "$title" >&2; return 6; }
+  suf_ask "$ref" "$prompt" "$@"
 }
 
 # v3 helper 유지 — 같은 workspace 의 다른 surface 목록
