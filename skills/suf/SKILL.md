@@ -31,7 +31,7 @@ description: cmux sidecar 사이의 agent-to-agent 통신. v5 부터 FIFO 응답
 ## 한 사이클
 
 ```
-parent: suf_ask <surface> <prompt>
+parent: suf_ask <surface-or-title> <prompt>
   ├─ 1) prompt cap 검사 (≤500자 default)
   ├─ 2) 모드 자동 감지: ps → "llm" | "worker" | "unknown"
   ├─ 3) JOB id 생성, /tmp/suf-fifo/<JOB>.res mkfifo
@@ -51,16 +51,17 @@ sidecar:          │
 
 ```bash
 source ~/.agents/skills/suf/scripts/suf-v5-lib.sh
-ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")
-ANSWER=$(suf_ask surface:6 "git log -5 --oneline" --mode worker)
-ANSWER=$(suf_ask_unsafe surface:9 "$LONG" --prompt-max 4000 --response-max 65536 --timeout 180)
+ANSWER=$(suf_ask "Claude Main" "현재 브랜치만 한 줄로")   # title 로 자동 매핑
+ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")       # 기존 surface ref 도 유지
+ANSWER=$(suf_ask "Worker Shell" "git log -5 --oneline" --mode worker)
+ANSWER=$(suf_ask_unsafe "Claude Main" "$LONG" --prompt-max 4000 --response-max 65536 --timeout 180)
 ```
 
 ### 비동기 (long task, fire-and-collect)
 
 ```bash
 # 1) 송신만 — parent 즉시 자유. job_id stdout.
-job=$(suf_send surface:9 "build 끝나면 한 줄 요약")
+job=$(suf_send "Claude Main" "build 끝나면 한 줄 요약")
 
 # 2-a) 나중에 blocking collect (timeout 길게)
 result=$(suf_collect "$job" --timeout 1800)
@@ -85,14 +86,15 @@ suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제�
 
 | 함수 | 시그니처 | 비고 |
 |---|---|---|
-| `suf_ask` | `<surface> <prompt> [--mode llm\|worker] [--timeout N]` | 동기. cap 강제 |
-| `suf_ask_unsafe` | `<surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]` | 동기. escape valve |
-| `suf_send` | `<surface> <prompt> [--mode]` | **비동기 송신**. stdout=job_id |
+| `suf_ask` | `<surface-or-title> <prompt> [--mode llm\|worker] [--timeout N]` | 동기. cap 강제. title 자동 매핑 |
+| `suf_ask_unsafe` | `<surface-or-title> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]` | 동기. escape valve |
+| `suf_send` | `<surface-or-title> <prompt> [--mode]` | **비동기 송신**. stdout=job_id. title 자동 매핑 |
 | `suf_collect` | `<job> [--timeout N] [--response-max N]` | **비동기 수신**. blocking read |
 | `suf_check` | `<job> [--wait N] [--poll-interval F]` | non-blocking probe. rc 0=ready, 1=not yet, 2=no job. ⚠️ destructive race 가능 — 함정 섹션 참조 |
 | `suf_tail` | `<job> [--timeout N]` | line 단위 stream until EOF |
 | `suf_cancel` | `<job> [--surface X]` | fifo unlink + (optional) ESC 송신 |
 | `suf_other_surfaces` | 인자 없음 | 같은 ws 의 다른 surface |
+| `suf_by_title` | `<title> <prompt> [opts]` | 호환용 wrapper. `suf_ask <title> ...` 권장 |
 
 ### exit codes
 
@@ -102,8 +104,9 @@ suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제�
 | 2 | prompt cap 초과 / 잘못된 인자 / 잘못된 mode |
 | 3 | sidecar 모드 auto-detect 실패 (`--mode` 명시 필요) |
 | 4 | mkfifo 실패 |
-| 5 | cmux send 실패 (surface 없음 등) |
+| 5 | title match 없음 / cmux send 실패 (surface 없음 등) |
 | 6 | no such job (suf_collect/check/tail 에서 fifo 없음) |
+| 7 | title fuzzy match 결과가 여러 개라 ambiguous |
 | 124 | timeout (FIFO read 가 deadline 전에 종료 안 됨) |
 
 ## 환경변수
@@ -128,6 +131,21 @@ suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제�
 ```
 
 `<surface> (<mode>) <elapsed>s <bytes>B <result>`. 호출자가 응답 stdout 만 받고 status 는 stderr 라 파이프라인 안전.
+
+## surface title 자동 매핑
+
+`suf_ask` / `suf_send` / `suf_ask_unsafe` 의 첫 인자는 `surface:9` 같은 ref 또는 cmux surface title 둘 다 가능하다.
+
+```bash
+suf_ask "Claude Main" "ping"     # exact title match
+suf_send "codex" "task"          # exact 없으면 case-insensitive substring fuzzy match
+suf_ask surface:9 "ping"          # 기존 방식도 그대로 동작
+```
+
+동작 규칙:
+- 첫 인자가 `surface:` 로 시작하면 그대로 사용한다.
+- 아니면 `cmux tree --all` 의 surface title 에서 **exact match 우선**, 없으면 **대소문자 무시 substring match**.
+- match 0개면 RC=5, 여러 개면 RC=7 과 후보 목록을 stderr 에 출력한다.
 
 ## 자동 감지 (LLM vs worker)
 
@@ -164,7 +182,7 @@ suf_other_surfaces   # 같은 workspace 의 다른 surface (cross-ws 자동 제�
 
 | v3/v4 호출 | v5 대응 |
 |---|---|
-| `suf_ask <surface> <prompt> [timeout]` | `suf_ask <surface> <prompt> [--timeout N]` (timeout 인자 위치 변경) |
+| `suf_ask <surface> <prompt> [timeout]` | `suf_ask <surface-or-title> <prompt> [--timeout N]` (timeout 인자 위치 변경 + title 지원) |
 | `suf_ask_file` | `suf_ask_unsafe --response-max N` 로 통합 (별도 spool 채널 폐기) |
 | `suf_send_file` | parent 가 직접 sidecar 의 cwd 에 파일 두고 path 만 inline 전달 권장 |
 | `suf_say / suf_wait / suf_hear` | v5 는 단발 blocking. 분리 호출 없음. 비동기 필요하면 v3 fallback |

@@ -95,10 +95,11 @@ suf_collect
 
 - **무엇** — 한 호출로 송신 + 응답까지. parent blocking. v3/v4 의 핵심 API 와 같은 모양.
 - **언제** — 짧은 ack/조회 (< 30초 예상). 99% 케이스. **default 첫 선택**.
+- **대상 지정** — 첫 인자는 `surface:9` 같은 ref 또는 cmux surface title 둘 다 가능. title 은 exact 우선, 없으면 fuzzy substring match.
 
 **시그니처**:
 ```bash
-suf_ask <surface> <prompt> [--mode llm|worker] [--timeout N]
+suf_ask <surface-or-title> <prompt> [--mode llm|worker] [--timeout N]
 ```
 
 **출력**:
@@ -111,13 +112,16 @@ suf_ask <surface> <prompt> [--mode llm|worker] [--timeout N]
 
 **예제**:
 ```bash
-ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")
+ANSWER=$(suf_ask "Claude Main" "현재 브랜치만 한 줄로")
 # main
 
-ANSWER=$(suf_ask surface:6 "date +%H:%M" --mode worker)
+ANSWER=$(suf_ask surface:9 "현재 브랜치만 한 줄로")  # 기존 surface ref 도 유지
+# main
+
+ANSWER=$(suf_ask "Worker Shell" "date +%H:%M" --mode worker)
 # 16:34
 
-ANSWER=$(suf_ask surface:9 "test 결과 한 줄" --timeout 120)
+ANSWER=$(suf_ask "Claude Main" "test 결과 한 줄" --timeout 120)
 ```
 
 **주의** — prompt > 500자 면 즉시 reject. `suf_ask_unsafe` 또는 `SUF_V5_PROMPT_MAX` env 우회.
@@ -131,7 +135,7 @@ ANSWER=$(suf_ask surface:9 "test 결과 한 줄" --timeout 120)
 
 **시그니처**:
 ```bash
-suf_ask_unsafe <surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]
+suf_ask_unsafe <surface-or-title> <prompt> [--mode] [--timeout N] [--prompt-max N] [--response-max N]
 ```
 
 **출력** — `suf_ask` 와 동일.
@@ -139,7 +143,7 @@ suf_ask_unsafe <surface> <prompt> [--mode] [--timeout N] [--prompt-max N] [--res
 **예제**:
 ```bash
 # 1KB prompt, 64KB 응답, 5분
-result=$(suf_ask_unsafe surface:9 "$LONG_PROMPT" \
+result=$(suf_ask_unsafe "Claude Main" "$LONG_PROMPT" \
   --prompt-max 4000 --response-max 65536 --timeout 300)
 ```
 
@@ -161,7 +165,7 @@ result=$(suf_ask_unsafe surface:9 "$LONG_PROMPT" \
 
 **시그니처**:
 ```bash
-suf_send <surface> <prompt> [--mode llm|worker]
+suf_send <surface-or-title> <prompt> [--mode llm|worker]
 ```
 
 **출력**:
@@ -174,7 +178,7 @@ suf_send <surface> <prompt> [--mode llm|worker]
 
 **예제**:
 ```bash
-job=$(suf_send surface:9 "test 결과 한 줄")
+job=$(suf_send "Claude Main" "test 결과 한 줄")
 echo "job: $job"
 # 1779694440788107000-30226-3269f5b8
 
@@ -533,8 +537,9 @@ prompt 의 auto-cap 안내문 (`printf "..." > /tmp/suf-fifo/<job>.res`) 을 sid
 | 2 | prompt cap 초과 / 잘못된 인자 / 잘못된 mode |
 | 3 | sidecar auto-detect 실패 (`--mode` 필요) |
 | 4 | mkfifo 실패 |
-| 5 | cmux send / fifo open 실패 |
+| 5 | title match 없음 / cmux send / fifo open 실패 |
 | 6 | no such job (collect/check/tail) |
+| 7 | title match ambiguous |
 | 124 | timeout |
 
 ---
@@ -556,17 +561,17 @@ prompt 의 auto-cap 안내문 (`printf "..." > /tmp/suf-fifo/<job>.res`) 을 sid
 
 ```bash
 # 동기 한 줄
-ans=$(suf_ask surface:9 "현재 시간")
+ans=$(suf_ask "Claude Main" "현재 시간")
 
 # 비동기 — 보내고 1분 뒤 받기
-j=$(suf_send surface:9 "task X"); sleep 60; ans=$(suf_collect "$j")
+j=$(suf_send "Claude Main" "task X"); sleep 60; ans=$(suf_collect "$j")
 
 # 폴링
-j=$(suf_send surface:9 "task"); while ! suf_check "$j"; do sleep 5; done; ans=$(suf_collect "$j")
+j=$(suf_send "Claude Main" "task"); while ! suf_check "$j"; do sleep 5; done; ans=$(suf_collect "$j")
 
 # 진척 stream
-j=$(suf_send surface:9 "build 진척"); suf_tail "$j" --timeout 1800
+j=$(suf_send "Claude Main" "build 진척"); suf_tail "$j" --timeout 1800
 
 # 취소
-j=$(suf_send surface:9 "long task"); sleep 10; suf_cancel "$j" --surface surface:9
+j=$(suf_send "Claude Main" "long task"); sleep 10; suf_cancel "$j" --surface surface:9
 ```

@@ -7,12 +7,12 @@
 #  - 4종 cap 강제 (prompt size / response size / timeout / auto-cap 문구).
 #  - suf_ask 는 기본 안전, suf_ask_unsafe 는 명시적 escape valve.
 #
-# Public:  suf_ask  suf_ask_unsafe  suf_other_surfaces
+# Public:  suf_ask  suf_ask_unsafe  suf_send  suf_collect  suf_check  suf_tail  suf_cancel  suf_by_title  suf_other_surfaces
 #
 # 사용:
 #   source /path/to/suf-v5-lib.sh
-#   ANSWER=$(suf_ask surface:9 "현재 브랜치만 알려줘")
-#   ANSWER=$(suf_ask surface:4 "git log -5 --oneline" --mode worker)
+#   ANSWER=$(suf_ask "Claude Main" "현재 브랜치만 알려줘")  # title 자동 매핑
+#   ANSWER=$(suf_ask surface:4 "git log -5 --oneline" --mode worker)  # surface ref 도 유지
 
 # ---- defaults (env override 가능) ----
 : "${SUF_V5_PROMPT_MAX:=500}"      # prompt 글자 cap
@@ -146,6 +146,56 @@ _suf_v5_send() {
   fi
 }
 
+# stdout: surface ref. 입력이 surface:* 이면 그대로, 아니면 title exact → fuzzy 순으로 resolve.
+# rc: 0=ok, 5=no match / cmux tree fail, 7=ambiguous title
+_suf_v5_resolve_surface() {
+  local target="$1" rows matches count
+
+  case "$target" in
+    surface:*) printf '%s\n' "$target"; return 0 ;;
+  esac
+
+  rows="$(cmux tree --all 2>/dev/null \
+    | awk '
+        /surface:[^ ]+/ {
+          ref = ""; title = "";
+          if (match($0, /surface:[^ ]+/)) ref = substr($0, RSTART, RLENGTH);
+          if (match($0, /"[^"]*"/)) title = substr($0, RSTART+1, RLENGTH-2);
+          if (ref != "" && title != "") printf "%s\t%s\n", ref, title;
+        }')"
+  if [ -z "$rows" ]; then
+    printf '[suf v5] cannot read cmux surfaces while resolving title: %s\n' "$target" >&2
+    return 5
+  fi
+
+  # 1) exact title match
+  matches="$(printf '%s\n' "$rows" | awk -F '\t' -v q="$target" '$2 == q { print }')"
+  count="$(printf '%s\n' "$matches" | awk 'NF { n++ } END { print n + 0 }')"
+
+  # 2) unique case-insensitive substring match
+  if [ "$count" -eq 0 ]; then
+    matches="$(printf '%s\n' "$rows" \
+      | awk -F '\t' -v q="$target" 'BEGIN { lq = tolower(q) } index(tolower($2), lq) > 0 { print }')"
+    count="$(printf '%s\n' "$matches" | awk 'NF { n++ } END { print n + 0 }')"
+  fi
+
+  case "$count" in
+    1)
+      printf '%s\n' "$matches" | awk -F '\t' 'NR == 1 { print $1 }'
+      return 0
+      ;;
+    0)
+      printf '[suf v5] no surface title matches: %s\n' "$target" >&2
+      return 5
+      ;;
+    *)
+      printf '[suf v5] ambiguous surface title: %s\n' "$target" >&2
+      printf '%s\n' "$matches" | awk -F '\t' '{ printf "  %s\t%s\n", $1, $2 }' >&2
+      return 7
+      ;;
+  esac
+}
+
 # blocking read with hard timeout (perl alarm) + byte cap.
 # stdout: 본문, stderr: 경고, exit: 0=ok, 124=timeout, 5=open fail
 _suf_v5_read_fifo() {
@@ -242,13 +292,13 @@ _suf_v5_dispatch() {
 
 # ---- public ----
 
-# suf_ask <surface> <prompt> [--mode llm|worker] [--timeout N]
+# suf_ask <surface-or-title> <prompt> [--mode llm|worker] [--timeout N]
 suf_ask() {
   if [ $# -lt 2 ]; then
-    printf 'usage: suf_ask <surface> <prompt> [--mode llm|worker] [--timeout N]\n' >&2
+    printf 'usage: suf_ask <surface-or-title> <prompt> [--mode llm|worker] [--timeout N]\n' >&2
     return 2
   fi
-  local surface="$1" prompt="$2" mode="" timeout="$SUF_V5_TIMEOUT"
+  local target="$1" surface prompt="$2" mode="" timeout="$SUF_V5_TIMEOUT"
   shift 2
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -262,18 +312,19 @@ suf_ask() {
       "${#prompt}" "$SUF_V5_PROMPT_MAX" >&2
     return 2
   fi
+  surface="$(_suf_v5_resolve_surface "$target")" || return $?
   _suf_v5_dispatch "$surface" "$prompt" "$mode" "$timeout" "$SUF_V5_RESPONSE_MAX"
 }
 
 # suf_ask_unsafe — cap 우회. 큰 응답이 의도적임을 호출자가 선언.
-# suf_ask_unsafe <surface> <prompt> [--mode ...] [--timeout N]
-#                [--prompt-max N] [--response-max N]
+# suf_ask_unsafe <surface-or-title> <prompt> [--mode ...] [--timeout N]
+#                         [--prompt-max N] [--response-max N]
 suf_ask_unsafe() {
   if [ $# -lt 2 ]; then
-    printf 'usage: suf_ask_unsafe <surface> <prompt> [opts]\n' >&2
+    printf 'usage: suf_ask_unsafe <surface-or-title> <prompt> [opts]\n' >&2
     return 2
   fi
-  local surface="$1" prompt="$2" mode="" \
+  local target="$1" surface prompt="$2" mode="" \
     timeout="$SUF_V5_TIMEOUT" prompt_max=99999 response_max=$((1024*1024))
   shift 2
   while [ $# -gt 0 ]; do
@@ -289,19 +340,20 @@ suf_ask_unsafe() {
     printf '[suf v5] prompt size %d > %d\n' "${#prompt}" "$prompt_max" >&2
     return 2
   fi
+  surface="$(_suf_v5_resolve_surface "$target")" || return $?
   _suf_v5_dispatch "$surface" "$prompt" "$mode" "$timeout" "$response_max"
 }
 
 # ---- async fire-and-collect API ----
 
 # 송신만. fifo 생성 + cmux send. stdout=job_id, stderr=status.
-# suf_send <surface> <prompt> [--mode llm|worker]
+# suf_send <surface-or-title> <prompt> [--mode llm|worker]
 suf_send() {
   if [ $# -lt 2 ]; then
-    printf 'usage: suf_send <surface> <prompt> [--mode llm|worker]\n' >&2
+    printf 'usage: suf_send <surface-or-title> <prompt> [--mode llm|worker]\n' >&2
     return 2
   fi
-  local surface="$1" prompt="$2" mode=""
+  local target="$1" surface prompt="$2" mode=""
   shift 2
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -313,6 +365,8 @@ suf_send() {
     printf '[suf v5] prompt size %d > PROMPT_MAX=%d\n' "${#prompt}" "$SUF_V5_PROMPT_MAX" >&2
     return 2
   fi
+
+  surface="$(_suf_v5_resolve_surface "$target")" || return $?
 
   if [ -z "$mode" ]; then
     mode="$(_suf_v5_detect "$surface")"
@@ -493,17 +547,11 @@ suf_cancel() {
 }
 
 # suf_by_title <title> <prompt> [--mode llm|worker] [--timeout N]
-#   title 로 surface 찾아 suf_ask 위임. 다중 매치 시 첫 번째.
+#   호환용 wrapper. 이제 suf_ask/suf_send 첫 인자도 title 을 직접 받는다.
 suf_by_title() {
   [ $# -ge 2 ] || { printf 'usage: suf_by_title <title> <prompt> [opts]\n' >&2; return 2; }
   local title="$1" prompt="$2"; shift 2
-  local ref
-  ref="$(cmux tree --all 2>/dev/null \
-    | grep -F "\"$title\"" \
-    | grep -oE 'surface:[0-9]+' \
-    | head -1)"
-  [ -n "$ref" ] || { printf '[suf v5] no surface titled %s\n' "$title" >&2; return 6; }
-  suf_ask "$ref" "$prompt" "$@"
+  suf_ask "$title" "$prompt" "$@"
 }
 
 # v3 helper 유지 — 같은 workspace 의 다른 surface 목록
