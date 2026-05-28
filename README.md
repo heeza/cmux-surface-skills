@@ -2,26 +2,26 @@
 
 [cmux](https://cmux.run) 환경에서 agent ↔ agent 통신과 일상 개발을 돕는 Claude/Codex/Gemini 공용 스킬 모음. `~/.agents/` 에 두고 `~/.claude/skills/`, `~/.codex/`, `~/.gemini/` 등에서 심볼릭으로 참조하는 글로벌 공유 디렉토리.
 
-## 헤드라인 — `suf`
+## 헤드라인 — `cmux`
 
-cmux sidecar 와 **마커 + scrollback 폴링** 으로 통신하는 agent-to-agent 프로토콜. 옆 패널의 Claude/Codex/agy/shell 에 질문을 던지고 자연 응답만으로 본문을 추출.
+cmux sidecar 사이의 짧은 agent-to-agent 통신 스킬. v5는 per-job FIFO 응답 채널을 사용해 sidecar 답변을 blocking read로 받고, LLM/shell worker mode를 자동 감지한다.
 
 ```bash
-source ~/.agents/skills/suf/scripts/suf-lib.sh
-ANSWER=$(suf_ask surface:4 "현황 보고")
+source ~/.agents/skills/cmux/scripts/cmux-v5-lib.sh
+ANSWER=$(cmux_ask surface:9 "현재 브랜치만 한 줄로")
+ANSWER=$(cmux_ask surface:6 "git log -5 --oneline" --mode worker)
 ```
 
-한 사이클: **say → wait → hear**
+주요 API:
 
-- `say`: 답변 마커 (`<<<SUF_ANSWER:$JOB>>>` ... `<<<SUF_END:$JOB>>>`) 를 동봉해 메시지 송신
-- `wait`: scrollback 의 END 마커 등장 횟수 폴링 (`>= 2` 면 sidecar 응답 완료)
-- `hear`: 마지막 ANSWER..END 블록만 추출 — prompt echo 블록 자연 폐기
+- `cmux_ask` / `cmux_ask_unsafe` — 동기 ask
+- `cmux_send` + `cmux_collect` — 비동기 fire-and-collect
+- `cmux_check` — non-blocking probe
+- `cmux_tail` — line stream
+- `cmux_cancel` — FIFO 정리 + optional ESC
+- `cmux_other_surfaces` — 같은 workspace 의 다른 surface 탐색
 
-### 왜 scrollback 폴링인가
-
-`cmux wait-for --signal` 기반 ack 방식은 sidecar 가 답변 작성 후 **별도 shell 명령** 을 실행해야 신호가 전달된다. LLM sidecar 가 그 단계를 자주 누락 → 무한 블록. 폴링은 자연 응답만으로 끝난다.
-
-자세한 사용법: [`skills/suf/SKILL.md`](skills/suf/SKILL.md)
+자세한 사용법: [`skills/cmux/SKILL.md`](skills/cmux/SKILL.md), [`skills/cmux/USAGE.md`](skills/cmux/USAGE.md)
 
 ## 그 외 스킬
 
@@ -47,7 +47,7 @@ ANSWER=$(suf_ask surface:4 "현황 보고")
 
 ### 1. cmux 설치
 
-`suf` 와 `cmux` 스킬의 필수 의존성.
+`cmux` 스킬의 필수 의존성.
 
 ```bash
 brew install cmux   # 또는 https://cmux.run 가이드
@@ -67,7 +67,7 @@ git clone https://github.com/heeza/cmux-surface-skills.git ~/.agents
 
 ```bash
 mkdir -p ~/.claude/skills
-for skill in suf find-skills caveman; do
+for skill in cmux find-skills caveman; do
   ln -sfn "../../.agents/skills/$skill" "$HOME/.claude/skills/$skill"
 done
 ```
@@ -86,7 +86,7 @@ done
 
 ```bash
 mkdir -p ~/.codex
-printf '\n@%s/.agents/skills/suf/SKILL.md\n' "$HOME" >> ~/.codex/AGENTS.md
+printf '\n@%s/.agents/skills/cmux/SKILL.md\n' "$HOME" >> ~/.codex/AGENTS.md
 ```
 
 다른 스킬도 노출하려면 같은 패턴으로 `@$HOME/.agents/skills/<name>/SKILL.md` 라인 추가.
@@ -97,8 +97,9 @@ Gemini CLI 는 별도 스킬 시스템이 없어 자동 노출 안 됨. 필요�
 
 ## 의존성
 
-- [cmux](https://cmux.run) — `suf`, `cmux` 관련 스킬
-- bash 4+ — `suf-lib.sh`
+- [cmux](https://cmux.run) — `cmux` 스킬 필수
+- bash 4+ — `cmux-v5-lib.sh`, legacy `cmux-lib.sh`
+- perl — v5 FIFO timeout/sysread
 - 그 외 스킬은 대부분 self-contained
 
 ## 레이아웃
@@ -108,10 +109,12 @@ Gemini CLI 는 별도 스킬 시스템이 없어 자동 노출 안 됨. 필요�
 ├── rules/
 │   └── antigravity-rtk-rules.md
 └── skills/
-    ├── suf/
+    ├── cmux/
     │   ├── SKILL.md
+    │   ├── USAGE.md
     │   └── scripts/
-    │       └── suf-lib.sh
+    │       ├── cmux-v5-lib.sh
+    │       └── cmux-lib.sh
     ├── diagnose/
     ├── tdd/
     └── ...
