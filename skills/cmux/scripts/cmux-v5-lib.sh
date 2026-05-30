@@ -35,6 +35,35 @@
 
 # ---- private ----
 
+_CMUX_V5_TREE_CACHE=""
+_CMUX_V5_TREE_CACHE_TIME=0
+_CMUX_V5_TREE_FOCUSED_CACHE=""
+_CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+
+_cmux_v5_get_tree() {
+  local now
+  now=$(date +%s)
+  if [ -n "$_CMUX_V5_TREE_CACHE" ] && [ $((now - _CMUX_V5_TREE_CACHE_TIME)) -lt 1 ]; then
+    printf '%s\n' "$_CMUX_V5_TREE_CACHE"
+    return 0
+  fi
+  _CMUX_V5_TREE_CACHE="$(cmux tree --all 2>/dev/null)"
+  _CMUX_V5_TREE_CACHE_TIME="$now"
+  printf '%s\n' "$_CMUX_V5_TREE_CACHE"
+}
+
+_cmux_v5_get_tree_focused() {
+  local now
+  now=$(date +%s)
+  if [ -n "$_CMUX_V5_TREE_FOCUSED_CACHE" ] && [ $((now - _CMUX_V5_TREE_FOCUSED_CACHE_TIME)) -lt 1 ]; then
+    printf '%s\n' "$_CMUX_V5_TREE_FOCUSED_CACHE"
+    return 0
+  fi
+  _CMUX_V5_TREE_FOCUSED_CACHE="$(cmux tree 2>/dev/null)"
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME="$now"
+  printf '%s\n' "$_CMUX_V5_TREE_FOCUSED_CACHE"
+}
+
 # title-or-ref → surface:N. 인자가 surface:N 패턴이면 그대로, 아니면 title lookup.
 # 다중 매치 시 첫 번째. 실패 시 stderr + rc 6.
 _cmux_v5_resolve() {
@@ -44,7 +73,7 @@ _cmux_v5_resolve() {
     return 0
   fi
   local ref
-  ref="$(cmux tree --all 2>/dev/null \
+  ref="$(_cmux_v5_get_tree \
     | grep -F "\"$arg\"" \
     | grep -oE 'surface:[0-9]+' \
     | head -1)"
@@ -72,9 +101,15 @@ _cmux_v5_fifo_path() {
   printf '%s/%s.res' "$CMUX_V5_FIFO_DIR" "$1"
 }
 
+_cmux_v5_garbage_collect() {
+  # 12시간(720분) 이상 방치된 FIFO 파일들을 백그라운드에서 조용히 정리
+  find "$CMUX_V5_FIFO_DIR" -type p -mmin +720 -delete 2>/dev/null &
+}
+
 _cmux_v5_init_dir() {
-  [ -d "$CMUX_V5_FIFO_DIR" ] && return 0
+  [ -d "$CMUX_V5_FIFO_DIR" ] && { _cmux_v5_garbage_collect; return 0; }
   mkdir -p "$CMUX_V5_FIFO_DIR" && chmod 700 "$CMUX_V5_FIFO_DIR"
+  _cmux_v5_garbage_collect
 }
 
 _cmux_v5_make_fifo() {
@@ -109,7 +144,7 @@ _cmux_v5_surface_alive() {
   local surface="$1"
   [ -z "$surface" ] && return 1
   local num="${surface#surface:}"
-  cmux tree --all 2>/dev/null | grep -qE "surface:${num}([^0-9]|$)"
+  _cmux_v5_get_tree | grep -qE "surface:${num}([^0-9]|$)"
 }
 
 # surface ref 의 가장 최근 (mtime) pending FIFO 한 개 path. 없으면 빈 문자열.
@@ -128,7 +163,7 @@ _cmux_v5_pick_fifo() {
 _cmux_v5_surface_title() {
   local surface="$1"
   [ -z "$surface" ] && return 1
-  cmux tree --all 2>/dev/null \
+  _cmux_v5_get_tree \
     | awk -v s="$surface" '
         index($0, s) > 0 {
           if (match($0, /"[^"]+"/)) {
@@ -142,7 +177,7 @@ _cmux_v5_detect() {
   local surface="$1" tty short leader args
 
   # surface ref → tty. surface UUID 도 cmux tree 가 표시하므로 substring match
-  tty="$(cmux tree --all 2>/dev/null \
+  tty="$(_cmux_v5_get_tree \
     | awk -v s="$surface" '
         $0 ~ s {
           if (match($0, /tty=[^ ]+/)) {
@@ -349,11 +384,6 @@ PERL
 _cmux_v5_read_fifo_dynamic() {
   local fifo="$1" surface="$2" mode="$3" timeout="$4" rmax="$5"
 
-  local out="" rc=124 start elapsed
-  start=$(date +%s)
-
-  # Fast path: a single blocking FIFO read avoids cmux tree/read-screen/ps polling.
-  # Enable CMUX_V5_EARLY_IDLE only when failed jobs must return before timeout.
   if [ -n "$surface" ] && [ -z "$mode" ]; then
     mode="$(_cmux_v5_detect "$surface")"
   fi
@@ -367,20 +397,13 @@ _cmux_v5_read_fifo_dynamic() {
     *) early_idle=0 ;;
   esac
 
-  if [ "$early_idle" -eq 0 ]; then
-    _cmux_v5_read_fifo "$fifo" "$timeout" "$rmax"
-    return $?
-  fi
-
   local poll_interval="${CMUX_V5_POLL_INTERVAL:-1}"
-  local idle_count=0
-  local max_idle_checks="${CMUX_V5_MAX_IDLE_CHECKS:-10}" # default 10 seconds with 1s poll
-  local last_screen_hash=""
+  local max_idle_checks="${CMUX_V5_MAX_IDLE_CHECKS:-10}"
 
-  # Find TTY once at the start to speed up
+  # TTY 한번만 조회
   local tty="" short=""
   if [ -n "$surface" ]; then
-    tty="$(cmux tree --all 2>/dev/null \
+    tty="$(_cmux_v5_get_tree \
       | awk -v s="$surface" '
           $0 ~ s {
             if (match($0, /tty=[^ ]+/)) {
@@ -392,76 +415,101 @@ _cmux_v5_read_fifo_dynamic() {
     fi
   fi
 
-  while true; do
-    # Try reading from FIFO with a short timeout
-    out="$(_cmux_v5_read_fifo "$fifo" "$poll_interval" "$rmax")"
-    rc=$?
+  local out
+  # 단 한 번의 perl 호출로 FIFO 읽기 및 early idle 감지 루프 전체를 위임
+  out="$(perl - "$fifo" "$surface" "$mode" "$timeout" "$rmax" "$early_idle" "$poll_interval" "$max_idle_checks" "$short" <<'PERL'
+use strict;
+use warnings;
+use Fcntl qw(O_RDONLY O_NONBLOCK);
+use Time::HiRes qw(time sleep);
+use IO::Select;
 
-    if [ "$rc" -eq 0 ]; then
-      # Success! Got the response.
-      break
-    elif [ "$rc" -ne 124 ]; then
-      # Other error (e.g. open fail, exit code 5)
-      break
-    fi
+my ($fifo, $surface, $mode, $timeout, $rmax, $early_idle, $poll_interval, $max_idle_checks, $short) = @ARGV;
+$timeout = $timeout + 0;
+$rmax = $rmax + 0;
+$early_idle = $early_idle + 0;
+$poll_interval = $poll_interval + 0;
+$max_idle_checks = $max_idle_checks + 0;
 
-    # Check if total timeout exceeded
-    elapsed=$(( $(date +%s) - start ))
-    if [ "$elapsed" -ge "$timeout" ]; then
-      rc=124
-      break
-    fi
+my $start_time = time;
+my $deadline = $start_time + $timeout;
+my $buf = "";
+my $remaining = $rmax;
 
-    # Check if sidecar is still active
-    local is_active=1
+sysopen(my $fh, $fifo, O_RDONLY | O_NONBLOCK) or do {
+    print STDERR "[cmux v5] open fail: $!\n";
+    exit 5;
+};
+my $select = IO::Select->new($fh);
 
-    if [ -n "$short" ] && [ "$mode" != "unknown" ]; then
-      local procs
-      procs="$(ps -ww -t "$short" -o args= 2>/dev/null)"
+my $idle_count = 0;
+my $last_screen_hash = "";
 
-      if [ "$mode" = "worker" ]; then
-        # Check if any active process other than shell is running on this TTY
-        local active_procs
-        active_procs="$(printf '%s\n' "$procs" | grep -vE '(^|/)(zsh|bash|sh|fish|dash|ksh|tcsh)( |$)' | grep -v 'ps -ww')"
-        if [ -z "$active_procs" ]; then
-          is_active=0
-        fi
-      elif [ "$mode" = "llm" ]; then
-        local current_screen
-        current_screen="$(cmux read-screen --surface "$surface" --lines 30 2>/dev/null)"
-
-        local current_hash
-        if command -v md5 >/dev/null 2>&1; then
-          current_hash="$(printf '%s' "$current_screen" | md5)"
-        elif command -v sha256sum >/dev/null 2>&1; then
-          current_hash="$(printf '%s' "$current_screen" | sha256sum | awk '{print $1}')"
-        else
-          current_hash="${#current_screen}"
-        fi
-
-        if [ "$current_hash" != "$last_screen_hash" ]; then
-          last_screen_hash="$current_hash"
-          idle_count=0
-        else
-          idle_count=$((idle_count + 1))
-
-          # If prompt is found at the end, declare idle immediately
-          if printf '%s\n' "$current_screen" | tail -n 5 | grep -qiE '(User:|Input:|Prompt:|❯|>\s*$)'; then
-            is_active=0
-          elif [ "$idle_count" -ge "$max_idle_checks" ]; then
-            is_active=0
-          fi
-        fi
-      fi
-    fi
-
-    if [ "$is_active" -eq 0 ]; then
-      printf '[cmux v5] sidecar on %s became idle without writing to FIFO. terminating wait.\n' "$surface" >&2
-      rc=125
-      break
-    fi
-  done
-
+my $rc = 124;
+while (time < $deadline && $remaining > 0) {
+    if ($select->can_read($poll_interval)) {
+        my $r = sysread $fh, my $chunk, $remaining;
+        if (!defined $r) {
+            print STDERR "[cmux v5] read err: $!\n";
+            $rc = 5;
+            last;
+        }
+        if ($r == 0) {
+            # EOF
+            $rc = 0;
+            last;
+        }
+        $buf .= $chunk;
+        $remaining -= $r;
+        $rc = 0;
+        next;
+    }
+    
+    if (time >= $deadline) {
+        $rc = 124;
+        last;
+    }
+    
+    # Early idle detection
+    if ($early_idle && $short && $mode ne "unknown") {
+        my $is_active = 1;
+        my $procs = `ps -ww -t "$short" -o args= 2>/dev/null` // "";
+        
+        if ($mode eq "worker") {
+            my @active = grep { $_ !~ m{(^|/)(zsh|bash|sh|fish|dash|ksh|tcsh)( |$)} && $_ !~ /ps -ww/ } split(/\n/, $procs);
+            if (@active == 0) {
+                $is_active = 0;
+            }
+        } elsif ($mode eq "llm") {
+            my $screen = `cmux read-screen --surface "$surface" --lines 30 2>/dev/null` // "";
+            my $hash_val = length($screen) . "_" . ($screen =~ tr/\n/\n/);
+            
+            if ($hash_val eq $last_screen_hash) {
+                $idle_count++;
+                if ($screen =~ /(User:|Input:|Prompt:|❯|>\s*$)/i || $screen =~ /(User:|Input:|Prompt:|❯|>\s*)$/) {
+                    $is_active = 0;
+                } elsif ($idle_count >= $max_idle_checks) {
+                    $is_active = 0;
+                }
+            } else {
+                $last_screen_hash = $hash_val;
+                $idle_count = 0;
+            }
+        }
+        
+        if (!$is_active) {
+            print STDERR "[cmux v5] sidecar on $surface became idle without writing to FIFO. terminating wait.\n";
+            $rc = 125;
+            last;
+        }
+    }
+}
+close $fh;
+print $buf;
+exit $rc;
+PERL
+)"
+  local rc=$?
   printf '%s' "$out"
   return $rc
 }
@@ -816,16 +864,15 @@ cmux_check() {
   fifo="$(_cmux_v5_fifo_path "$job")"
   [ -p "$fifo" ] || return 2
   perl - "$fifo" "$wait_s" "$interval" <<'PERL'
-use Fcntl qw(O_RDONLY O_NONBLOCK);
-use IO::Select;
 use Time::HiRes qw(time sleep);
 my ($fifo, $wait_s, $interval) = @ARGV;
 my $deadline = time + $wait_s;
 while (1) {
-  sysopen(my $fh, $fifo, O_RDONLY | O_NONBLOCK) or exit 2;
-  my $s = IO::Select->new($fh);
-  if ($s->can_read(0)) { close $fh; exit 0; }
-  close $fh;
+  # FIFO를 직접 open하지 않고, lsof로 이 FIFO를 open하고 있는 프로세스(writer)가 있는지 확인 (Destructive race condition 방지)
+  my $lsof = `lsof -t "$fifo" 2>/dev/null`;
+  if ($lsof) {
+    exit 0;
+  }
   last if time >= $deadline;
   sleep $interval;
 }
@@ -834,7 +881,7 @@ PERL
 }
 
 # line 단위 stream until EOF (sidecar 가 fifo close).
-# 한 writer 로 line print + close 패턴에서만 작동.
+# --persistent 모드를 기본 제공하여, sidecar가 redirection >> 을 반복해도 조기 EOF로 끝나지 않도록 함.
 # cmux_tail <job> [--timeout N]
 cmux_tail() {
   [ $# -ge 1 ] || { printf 'usage: cmux_tail <job> [--timeout N]\n' >&2; return 2; }
@@ -852,21 +899,60 @@ cmux_tail() {
     printf '[cmux v5] no such job: %s\n' "$job" >&2
     return 6
   fi
-  perl - "$timeout" "$fifo" <<'PERL'
-my ($timeout, $fifo) = @ARGV;
+
+  # surface와 tty를 획득하여 Perl에 넘겨줘서 sidecar의 활성 상태 감지
+  local surface tty short
+  surface="$(_cmux_v5_fifo_to_surface "$fifo")"
+  if [ -n "$surface" ]; then
+    tty="$(_cmux_v5_get_tree \
+      | awk -v s="$surface" '
+          $0 ~ s {
+            if (match($0, /tty=[^ ]+/)) {
+              print substr($0, RSTART+4, RLENGTH-4); exit
+            }
+          }')"
+    if [ -n "$tty" ]; then
+      short="${tty##/dev/}"
+    fi
+  fi
+
+  perl - "$timeout" "$fifo" "$short" <<'PERL'
+my ($timeout, $fifo, $short) = @ARGV;
 # stdout 즉시 flush — sidecar 가 line 한 줄 흘릴 때마다 화면에 보임 (true streaming).
 $| = 1;
 STDOUT->autoflush(1) if STDOUT->can("autoflush");
 $SIG{ALRM} = sub { print STDERR "[cmux v5] tail timeout\n"; exit 124 };
 alarm $timeout;
-open(my $fh, "<", $fifo) or do { print STDERR "[cmux v5] tail open fail: $!\n"; exit 5 };
+
 my $n = 0;
-while (defined(my $line = <$fh>)) {
-  print $line;
-  $n++;
+my $deadline = time() + $timeout;
+
+while (time() < $deadline) {
+  # FIFO open 시도. writer가 올 때까지 block.
+  if (open(my $fh, "<", $fifo)) {
+    while (defined(my $line = <$fh>)) {
+      print $line;
+      $n++;
+    }
+    close $fh;
+  }
+  
+  # sidecar 가 완전히 작업을 끝냈는지 감시
+  if ($short) {
+    my $procs = `ps -ww -t "$short" -o args= 2>/dev/null` // "";
+    # active process가 없으면 (쉘만 있으면) 스트리밍 종료
+    my @active = grep { $_ !~ m{(^|/)(zsh|bash|sh|fish|dash|ksh|tcsh)( |$)} && $_ !~ /ps -ww/ } split(/\n/, $procs);
+    if (@active == 0) {
+      last;
+    }
+  } else {
+    # TTY 감지 불가 시 한 번의 read 후 루프 종료 (backward-compat)
+    last;
+  }
+  
+  select(undef, undef, undef, 0.1); # 100ms sleep
 }
 alarm 0;
-close $fh;
 # stdout 완전 flush 보장 후 stderr done 메시지 — 표시 순서 직관적.
 STDOUT->flush() if STDOUT->can("flush");
 print STDERR "[cmux v5] tail done, $n lines\n";
@@ -912,7 +998,7 @@ cmux_by_title() {
 # v3 helper 유지 — 같은 workspace 의 다른 surface 목록
 cmux_other_surfaces() {
   local tree workspace
-  tree="$(cmux tree 2>/dev/null)" || return 1
+  tree="$(_cmux_v5_get_tree_focused)" || return 1
   workspace="$(printf '%s\n' "$tree" \
     | awk '/here/ { for (i=1;i<=NF;i++) if ($i ~ /workspace:[0-9]+/) { print $i; exit } }')"
   [ -z "$workspace" ] && return 1

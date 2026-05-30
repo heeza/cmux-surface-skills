@@ -265,7 +265,7 @@ cmux_check "$job"; echo $?   # 1 또는 0
 cmux_check "$job" --wait 300 && result=$(cmux_collect "$job")
 ```
 
-**주의** — ⚠️ **destructive race**: check 가 nonblocking open + close 사이에 sidecar 의 writer 가 write 시작 중이면 SIGPIPE → collect 가 빈 응답 받는 케이스 발생. **진짜 안전한 폴링은 `cmux_collect --timeout 5` 자체** (kernel blocking read 이 native polling, race 없음).
+**주의** — **v5.2 안정성 향상**: 과거 버전에서 발생하던 destructive race(sysopen/close 반복 시 SIGPIPE 유발) 현상은 v5.2부터 `lsof` 기반의 Non-destructive Check 기술로 완벽히 예방되었습니다. 이제 안심하고 `cmux_check`를 사용할 수 있습니다.
 
 ---
 
@@ -318,7 +318,7 @@ cmux_tail "$job" --timeout 600 | tee build.log
 # 라인마다 즉시 화면 + log 파일
 ```
 
-**주의** — sidecar 가 `echo line >> $fifo` 반복하면 매번 EOF — tail 첫 줄만 받고 종료. **반드시 한 writer 로 묶어야** stream 작동.
+**주의** — **v5.2 Persistent 스트리밍**: 과거 버전에서는 `>>`를 통해 여러 차례 쪼개서 쓸 때 조기 종료되는 한계가 있었으나, v5.2부터는 Persistent Tail 방식이 도입되어 sidecar 프로세스가 실행 중인 동안에는 EOF를 만나더라도 FIFO를 자동 재오픈하여 계속 추적합니다.
 
 ---
 
@@ -519,9 +519,9 @@ prompt 의 auto-cap 안내문 (`printf "..." > /tmp/cmux-fifo/<job>.res`) 을 si
 
 `{ command; } > $fifo 2>&1` 패턴이라 command 가 100KB stdout 흘리면 fifo buffer 가득 차서 sidecar 가 block. parent 가 read 시작해야 풀림. parent 가 send 직후 즉시 collect (또는 tail) 호출 권장.
 
-### 4.6 cmux_tail 은 한 writer 가정
+### 4.6 cmux_tail 의 Multi-Writer 지원 (v5.2)
 
-`echo line >> fifo` 반복은 한 줄당 EOF — `tail` 이 첫 줄만 받고 종료. 한 writer 로 묶어야 stream. SKILL.md 의 sidecar 협조 패턴 참조.
+과거 버전에서는 `echo line >> fifo` 반복 시 매번 EOF가 감지되어 첫 줄만 받고 tail이 종료되는 이슈가 있었습니다. v5.2부터는 TTY 감시 기반의 Persistent Tail 모드가 도입되어, sidecar 프로세스가 완전히 종료되기 전까지는 FIFO를 반복 재오픈하며 정상 스트리밍합니다.
 
 ---
 

@@ -3,7 +3,12 @@ name: cmux
 description: cmux sidecar 사이의 짧은 agent-to-agent 통신. v5는 per-job FIFO 응답 채널과 자동 모드 감지(LLM|worker)를 사용한다. 짧은 ack/조회/단일 명령 위임에만 사용하고 큰 작업 위임은 금지한다.
 ---
 
-# cmux v5
+# cmux v5 (v5.2 고성능/고신뢰성 패치 적용)
+
+- **Perl 기반 Event-Loop**: dynamic read 시 매초 fork하던 오버헤드를 O(1)로 줄였습니다.
+- **Non-destructive Check**: `cmux_check`가 FIFO를 직접 열지 않고 `lsof`를 통해 writer 존재를 파악해 `SIGPIPE` 레이스를 원천 차단했습니다.
+- **Persistent Tail**: `cmux_tail`이 여러 차례 `>>`로 쪼개서 스트림을 쓰는 경우에도 끊어지지 않고 sidecar의 작업 완료 시까지 추적합니다.
+- **1초 TTL 캐시**: `cmux tree`를 매번 새로 긁는 대신 1초 캐싱하여 요청 지연을 약 0.5s 이상 단축했습니다.
 
 ## 원칙
 
