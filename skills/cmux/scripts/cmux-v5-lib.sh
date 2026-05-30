@@ -364,7 +364,8 @@ open(my $fh, "<", $fifo) or do {
 my $buf = "";
 my $remaining = $max + 0;
 while ($remaining > 0) {
-  my $r = sysread $fh, my $chunk, $remaining;
+  my $chunk;
+  my $r = sysread $fh, $chunk, $remaining;
   if (!defined $r) {
     print STDERR "[cmux v5] read err: $!\n";
     last;
@@ -448,7 +449,8 @@ my $last_screen_hash = "";
 my $rc = 124;
 while (time < $deadline && $remaining > 0) {
     if ($select->can_read($poll_interval)) {
-        my $r = sysread $fh, my $chunk, $remaining;
+        my $chunk;
+        my $r = sysread $fh, $chunk, $remaining;
         if (!defined $r) {
             print STDERR "[cmux v5] read err: $!\n";
             $rc = 5;
@@ -1016,4 +1018,147 @@ cmux_other_surfaces() {
           }
         }
       ' | sort -u
+}
+
+# cmux_cross <target> [analyzer] <prompt> [--rounds N]
+#   target  : 토론/수행 주체 (예: codex)
+#   analyzer: 검토/분석 주체 (예: claude). 생략 시 다른 LLM surface 자동 탐색. 없으면 target과 동일 (Self-Refinement 모드)
+#   prompt  : 최초 지시 사항
+cmux_cross() {
+  if [ $# -lt 2 ]; then
+    printf 'usage: cmux_cross <target> [analyzer] <prompt> [--rounds N]\n' >&2
+    return 2
+  fi
+  
+  local target="$1" analyzer="" prompt="" rounds=3
+  shift
+  
+  # 만약 두 번째 인자가 --로 시작하지 않고, 세 번째 인자가 존재하면 analyzer로 판단
+  if [[ "$1" != -* ]] && [ $# -ge 2 ]; then
+    analyzer="$1"
+    prompt="$2"
+    shift 2
+  else
+    prompt="$1"
+    shift 1
+  fi
+  
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rounds) rounds="$2"; shift 2 ;;
+      *) printf '[cmux v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+  
+  # target resolve
+  target="$(_cmux_v5_resolve "$target")" || return 6
+  
+  # analyzer 자동 탐색
+  if [ -z "$analyzer" ]; then
+    # target이 아니고 본인(CMUX_SURFACE_ID)도 아닌 다른 LLM surface 탐색
+    local other
+    for other in $(cmux_other_surfaces); do
+      local resolved_other
+      resolved_other="$(_cmux_v5_resolve "$other")"
+      if [ "$resolved_other" != "$target" ] && [ "$resolved_other" != "${CMUX_SURFACE_ID:-}" ]; then
+        local mode
+        mode="$(_cmux_v5_detect "$resolved_other")"
+        if [ "$mode" = "llm" ]; then
+          analyzer="$resolved_other"
+          break
+        fi
+      fi
+    done
+    # 마땅한 analyzer가 없으면 target 본인을 analyzer로 설정 (Self-Refinement 모드)
+    if [ -z "$analyzer" ]; then
+      analyzer="$target"
+      if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+        printf '[cmux v5] no other LLM surface found. fallback to Self-Refinement mode on %s\n' "$target" >&2
+      fi
+    fi
+  else
+    analyzer="$(_cmux_v5_resolve "$analyzer")" || return 6
+  fi
+  
+  if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+    printf '[cmux v5] starting cmux_cross: target=%s, analyzer=%s, rounds=%d\n' "$target" "$analyzer" "$rounds" >&2
+  fi
+  
+  local res="" feedback=""
+  
+  # Round 0: 최초 송신
+  if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+    printf '[cmux v5] [Round 0] Sending initial prompt to %s...\n' "$target" >&2
+  fi
+  res=$(cmux_ask "$target" "$prompt") || return $?
+  
+  local i
+  for ((i=1; i<=rounds; i++)); do
+    # Round i-1 검토 및 피드백 생성
+    local feedback_prompt
+    if [ "$analyzer" = "$target" ]; then
+      # Self-Refinement 피드백 프롬프트
+      feedback_prompt="[cmux_cross Self-Refinement Round $i/$rounds]
+이전 답변을 제공하셨습니다:
+$res
+
+현재 작업 폴더의 코드베이스를 다시 정밀 검토하여, 위 답변의 잠재적인 오류, 누락된 엣지 케이스, 또는 아키텍처적 개선점 3가지를 스스로 도출하고 더 나은 개선안을 제시해 주세요."
+    else
+      # 제3자 분석 피드백 프롬프트
+      feedback_prompt="[cmux_cross Feedback Round $i/$rounds]
+상대방($target)이 최초 지시사항에 대해 아래와 같이 답변했습니다:
+$res
+
+현재 작업 폴더의 코드베이스 사실 관계와 대조 분석하여, 상대방 답변의 오류, 개선 포인트, 혹은 추가 요구사항을 구체적으로 지적하는 피드백 의견을 작성해 주세요."
+    fi
+    
+    if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+      printf '[cmux v5] [Round %d] Requesting review from %s...\n' "$i" "$analyzer" >&2
+    fi
+    feedback=$(cmux_ask "$analyzer" "$feedback_prompt") || return $?
+    
+    # 피드백을 반영하여 target이 재답변
+    local target_prompt
+    if [ "$analyzer" = "$target" ]; then
+      target_prompt="[cmux_cross Self-Refinement Round $i/$rounds]
+스스로 분석한 개선 사항 및 피드백은 다음과 같습니다:
+$feedback
+
+위 피드백과 개선 방향을 전면적으로 반영하여, 코드베이스 사실에 입각한 더 완벽한 결과물을 재작성해 주세요."
+    else
+      target_prompt="[cmux_cross Feedback Round $i/$rounds]
+검토자($analyzer)로부터 다음과 같은 분석 피드백을 수신했습니다:
+$feedback
+
+위 피드백 지적 사항을 정밀 반영하여, 더 완벽한 코드베이스 개선안을 작성해 주세요."
+    fi
+    
+    if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+      printf '[cmux v5] [Round %d] Sending feedback back to %s...\n' "$i" "$target" >&2
+    fi
+    res=$(cmux_ask "$target" "$target_prompt") || return $?
+  done
+  
+  # 최종 요약 및 결론 도출
+  local final_prompt
+  if [ "$analyzer" = "$target" ]; then
+    final_prompt="[cmux_cross Final Summary]
+$rounds 회에 걸친 자가 개선(Self-Refinement)이 완료되었습니다.
+현재 최종 상태를 정리하고, 초기 버전 대비 어떤 점이 개선되었는지 핵심 요약을 포함하여 최종 결과물을 깔끔하게 요약해 주세요.
+
+[최종 답변]
+$res"
+  else
+    final_prompt="[cmux_cross Final Summary]
+상대방($target)과의 $rounds 회 토론이 완료되었습니다.
+상대방의 최종 개선안과 이에 대한 귀하의 분석 결과를 토대로, 최종 코드베이스 개선 결론 및 요약을 마크다운 문서 형식으로 깔끔하게 작성해 주세요.
+
+[상대방 최종 답변]
+$res"
+  fi
+  
+  if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+    printf '[cmux v5] Synthesizing final summary via %s...\n' "$analyzer" >&2
+  fi
+  cmux_ask "$analyzer" "$final_prompt"
 }

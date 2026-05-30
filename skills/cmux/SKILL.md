@@ -55,6 +55,7 @@ cmux_other_surfaces
 | `cmux_tail <job> [--timeout N]` | FIFO raw tail |
 | `cmux_cancel <job> [--esc]` | FIFO 삭제, optional ESC |
 | `cmux_check [job|surface|title]` | 가벼운 pending 확인. 결과 polling에는 `cmux_collect --timeout <짧게>` 권장 |
+| `cmux_cross <target> [analyzer] <prompt> [--rounds N]` | 교차 검토 및 피드백 토론 오케스트레이션 (3회 반복 디폴트) |
 
 `surface` 인자는 `surface:N` 또는 title을 받는다. title 다중 매치 시 첫 번째를 쓴다.
 

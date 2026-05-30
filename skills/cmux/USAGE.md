@@ -54,6 +54,7 @@ parent ◀───receive── sidecar       (cmux_collect 시점, timeout 자
 | 안전한 polling (race 없이 대기) | `cmux_collect --timeout 5` 반복 | kernel blocking = native polling |
 | 진행 중 작업 중단 | `cmux_cancel` | fifo unlink + 옵션 ESC |
 | 어느 surface 에 보낼지 자동 선택 | `cmux_other_surfaces` | discovery |
+| 에이전트 간 3회 반복 검토/피드백 | **`cmux_cross`** | 상호 검토 및 자가 개선 오케스트레이션 |
 
 ### "ask vs send/collect" 빠른 결정
 
@@ -397,6 +398,43 @@ done
 **주의** — cross-workspace 의도된 미지원. 다른 ws 의 surface 가 필요하면 그 ws 의 cmux send 직접 호출 (lib 우회).
 
 ---
+
+### 2.9 `cmux_cross` — 교차 토론 & 피드백 오케스트레이션 (v5.2 신규)
+
+- **무엇** — 두 에이전트(수행측 target + 검토측 analyzer) 사이의 교차 토론 루프를 동기식으로 오케스트레이션합니다.
+- **언제** — 코드베이스 개선안을 작성할 때, 최초 작성안을 다른 에이전트(혹은 자신)에게 검토받아 3회에 걸친 자가 개선(Self-Refinement)/상호 검토 루프를 거쳐 극도로 높은 퀄리티의 결론을 내고 싶을 때 사용합니다.
+
+**시그니처**:
+```bash
+cmux_cross <target> [analyzer] <prompt> [--rounds N]
+```
+
+**옵션 및 생략**:
+* `analyzer` 생략 시: 세션 목록에서 `target`이 아니고 본인도 아닌 첫 번째 LLM surface를 자동으로 검토자로 선정합니다.
+* 여분의 LLM surface가 없거나 탐색 실패 시: `target` 자신을 검토자로 설정하여 **자가 개선(Self-Refinement) 모드**로 자동 Fallback 처리합니다.
+* `--rounds N` (기본값: 3): 피드백 수집 및 재답변 루프의 반복 횟수입니다.
+
+**출력**:
+
+| 채널 | 내용 |
+|---|---|
+| stdout | 최종 조율/요약된 결론 본문 |
+| stderr | 각 라운드별 송수신 진행 상태로그 (CMUX_V5_QUIET=on 으로 비활성화 가능) |
+| RC | 0 정상 / 2 인자 오류 / 6 resolve 실패 / 124/125 timeout 등 |
+
+**예제**:
+```bash
+# minimax(본인) 세션에서 실행하여, codex가 초안을 짜고 claude가 이를 3회 검토/피드백하는 오케스트레이션
+final_summary=$(cmux_cross "codex" "claude" "index.js의 메모리 누수 가능성 검토 및 수정안 작성해줘")
+
+# 별도 검토자 지정 없이 codex가 스스로 3회 자가 개선 루프를 돌게 하는 모드
+final_summary=$(cmux_cross "codex" "이 함수 예외 처리 추가해줘" --rounds 3)
+```
+
+**주의** — 이 함수는 실행하는 본인 세션을 동기식(blocking)으로 대기시키므로, 본인 세션을 `analyzer`나 `target`으로 지정하면 데드락이 발생합니다. 반드시 다른 surface들을 지정하거나 생략(자동 지정/fallback)하여 호출해야 합니다.
+
+---
+
 
 ## 3. 실용 시나리오
 
