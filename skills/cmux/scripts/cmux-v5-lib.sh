@@ -1072,8 +1072,8 @@ cmux_cross() {
   local cross_pmax=1000000
   local cross_rmax="${CMUX_V5_CROSS_RESPONSE_MAX:-16384}"
 
-  # 만약 두 번째 인자가 --로 시작하지 않고, 세 번째 인자가 존재하면 analyzer로 판단
-  if [[ "$1" != -* ]] && [ $# -ge 2 ]; then
+  # 두 번째 인자(분석자 후보)와 세 번째 인자(프롬프트) 모두 옵션(--)이 아닐 때만 analyzer로 판단
+  if [[ "$1" != -* ]] && [[ "${2:-}" != -* ]] && [ $# -ge 2 ]; then
     analyzer="$1"
     prompt="$2"
     shift 2
