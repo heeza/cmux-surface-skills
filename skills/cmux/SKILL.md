@@ -8,7 +8,11 @@ description: cmux sidecar 사이의 짧은 agent-to-agent 통신. v5는 per-job 
 - **Perl 기반 Event-Loop**: dynamic read 시 매초 fork하던 오버헤드를 O(1)로 줄였습니다.
 - **Non-destructive Check**: `cmux_check`가 FIFO를 직접 열지 않고 `lsof`를 통해 writer 존재를 파악해 `SIGPIPE` 레이스를 원천 차단했습니다.
 - **Persistent Tail**: `cmux_tail`이 여러 차례 `>>`로 쪼개서 스트림을 쓰는 경우에도 끊어지지 않고 sidecar의 작업 완료 시까지 추적합니다.
-- **1초 TTL 캐시**: `cmux tree`를 매번 새로 긁는 대신 1초 캐싱하여 요청 지연을 약 0.5s 이상 단축했습니다.
+- **설정형 TTL 캐시**: `cmux tree`를 `CMUX_V5_TREE_TTL`(기본 3초) 동안 캐싱하여, 한 요청 내 resolve→detect→read 가 tree 를 재호출하지 않습니다.
+- **병렬 fan-in**: 무타겟 `cmux_collect`(전체 pending 회수)가 각 job 을 병렬 수집합니다. 총 대기시간이 합(sum)이 아니라 최댓값(max)이며, 자기가 띄운 collector 만 `wait` 하여 무관한 잡에 묶이지 않습니다.
+- **`cmux_broadcast` fan-out/fan-in**: 동일 prompt 를 여러 LLM surface 에 동시 질의하고 병렬 수신합니다. 응답은 surface 당 캡(토큰 bound), 1-shot 이라 무한 토큰 소요가 없습니다.
+- **`cmux_cross` 복구**: 라운드마다 직전 답변을 임베드할 때 `PROMPT_MAX(500)` 캡에 걸려 중단되던 문제를 해소하고, 응답을 `CMUX_V5_CROSS_RESPONSE_MAX`(기본 16384B)로 캡하여 라운드 누적 토큰을 bound 합니다.
+- **빈 응답 즉시 종료**: side-effect-only worker 명령·no-match·빈 답변(0바이트) 이 timeout 까지 hang 되지 않고 즉시 `rc=0` 으로 반환됩니다.
 
 ## 원칙
 
@@ -38,6 +42,15 @@ job=$(cmux_send "codex" "build 끝나면 한 줄 요약")
 cmux_collect "$job" --timeout 600
 ```
 
+여러 에이전트에 동시 질의 (fan-out → 병렬 fan-in):
+
+```bash
+# 대상 지정
+cmux_broadcast "현재 브랜치만 한 줄로" "codex" "minimax" "agy"
+# 대상 생략 시 같은 workspace 의 다른 LLM surface 전체
+cmux_broadcast "한 줄 상태 보고" --timeout 120
+```
+
 현재 workspace의 다른 surface:
 
 ```bash
@@ -55,7 +68,8 @@ cmux_other_surfaces
 | `cmux_tail <job> [--timeout N]` | FIFO raw tail |
 | `cmux_cancel <job> [--esc]` | FIFO 삭제, optional ESC |
 | `cmux_check [job|surface|title]` | 가벼운 pending 확인. 결과 polling에는 `cmux_collect --timeout <짧게>` 권장 |
-| `cmux_cross <target> [analyzer] <prompt> [--rounds N]` | 교차 검토 및 피드백 토론 오케스트레이션 (3회 반복 디폴트) |
+| `cmux_cross <target> [analyzer] <prompt> [--rounds N]` | 교차 검토 및 피드백 토론 오케스트레이션 (3회 반복 디폴트). 응답은 `CMUX_V5_CROSS_RESPONSE_MAX`로 캡 |
+| `cmux_broadcast <prompt> [target ...] [--mode m] [--timeout N] [--response-max N]` | 동일 prompt 를 여러 LLM surface 에 fan-out 후 병렬 fan-in. 대상 생략 시 같은 workspace 의 다른 LLM 전체. 1-shot·응답 캡으로 토큰 bound |
 
 `surface` 인자는 `surface:N` 또는 title을 받는다. title 다중 매치 시 첫 번째를 쓴다.
 
@@ -67,6 +81,8 @@ cmux_other_surfaces
 | `CMUX_V5_RESPONSE_MAX` | 4096 | 응답 바이트 cap |
 | `CMUX_V5_TIMEOUT` | 1200 | FIFO blocking read 초 (20분) |
 | `CMUX_V5_AUTO_CAP` | on | LLM 수신 규칙 자동 첨부 |
+| `CMUX_V5_TREE_TTL` | 3 | `cmux tree` 캐시 TTL(초). resolve→detect→read 간 fork 재사용 |
+| `CMUX_V5_CROSS_RESPONSE_MAX` | 16384 | `cmux_cross` 라운드별 응답 바이트 캡 (토큰 bound) |
 | `CMUX_V5_PROMPT_STYLE` | compact | `compact|verbose` |
 | `CMUX_V5_FALLBACK_SCREEN` | off | `cmux read-screen` marker fallback opt-in |
 | `CMUX_V5_SCREEN_LINES` | 200 | screen fallback 라인 수 |

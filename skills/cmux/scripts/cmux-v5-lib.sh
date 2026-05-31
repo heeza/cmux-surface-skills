@@ -26,6 +26,7 @@
 : "${CMUX_V5_RESPONSE_MAX:=4096}"   # 응답 바이트 cap
 : "${CMUX_V5_TIMEOUT:=1200}"        # blocking read 초
 : "${CMUX_V5_AUTO_CAP:=on}"         # on|off — prompt 끝에 안내문 자동 첨부
+: "${CMUX_V5_TREE_TTL:=3}"          # cmux tree 캐시 TTL(초). resolve→detect→dynamic 간 tree fork 재사용
 : "${CMUX_V5_FIFO_DIR:=/tmp/cmux-fifo}"
 : "${CMUX_V5_FALLBACK_SCREEN:=off}" # on|off — FIFO 무응답 시 read-screen 마커 추출 fallback
 : "${CMUX_V5_SCREEN_LINES:=200}"    # fallback 추출 시 read-screen 라인 수
@@ -39,11 +40,12 @@ _CMUX_V5_TREE_CACHE=""
 _CMUX_V5_TREE_CACHE_TIME=0
 _CMUX_V5_TREE_FOCUSED_CACHE=""
 _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+_CMUX_V5_GC_DONE=0
 
 _cmux_v5_get_tree() {
   local now
   now=$(date +%s)
-  if [ -n "$_CMUX_V5_TREE_CACHE" ] && [ $((now - _CMUX_V5_TREE_CACHE_TIME)) -lt 1 ]; then
+  if [ -n "$_CMUX_V5_TREE_CACHE" ] && [ $((now - _CMUX_V5_TREE_CACHE_TIME)) -lt "${CMUX_V5_TREE_TTL:-3}" ]; then
     printf '%s\n' "$_CMUX_V5_TREE_CACHE"
     return 0
   fi
@@ -55,7 +57,7 @@ _cmux_v5_get_tree() {
 _cmux_v5_get_tree_focused() {
   local now
   now=$(date +%s)
-  if [ -n "$_CMUX_V5_TREE_FOCUSED_CACHE" ] && [ $((now - _CMUX_V5_TREE_FOCUSED_CACHE_TIME)) -lt 1 ]; then
+  if [ -n "$_CMUX_V5_TREE_FOCUSED_CACHE" ] && [ $((now - _CMUX_V5_TREE_FOCUSED_CACHE_TIME)) -lt "${CMUX_V5_TREE_TTL:-3}" ]; then
     printf '%s\n' "$_CMUX_V5_TREE_FOCUSED_CACHE"
     return 0
   fi
@@ -102,7 +104,10 @@ _cmux_v5_fifo_path() {
 }
 
 _cmux_v5_garbage_collect() {
-  # 12시간(720분) 이상 방치된 FIFO 파일들을 백그라운드에서 조용히 정리
+  # 12시간(720분) 이상 방치된 FIFO 파일들을 백그라운드에서 조용히 정리.
+  # send/collect 마다 find 를 fork 하지 않도록 셸 세션당 1회만 수행.
+  [ "$_CMUX_V5_GC_DONE" = "1" ] && return 0
+  _CMUX_V5_GC_DONE=1
   find "$CMUX_V5_FIFO_DIR" -type p -mmin +720 -delete 2>/dev/null &
 }
 
@@ -199,29 +204,16 @@ _cmux_v5_detect() {
     return 1
   fi
 
-  # LLM 우선 매칭 (LLM 이 떠 있으면 shell 도 같이 있는 게 정상)
-  if printf '%s' "$procs" \
-      | grep -qE '(^|/)(claude|codex|gemini|opencode|omc|omo|omx|agy|antigravity|junie)( |$)'; then
-    echo llm; return 0
-  fi
-  if printf '%s' "$procs" | grep -qiE '(anthropic|openai|antigravity)'; then
-    echo llm; return 0
-  fi
-  # claude/codex 의 node-launched 변형
-  if printf '%s' "$procs" | grep -qE 'node .*(claude|codex|gemini|agy|antigravity)'; then
-    echo llm; return 0
-  fi
-  # 사용자 정의 — pi 같이 짧은 이름
-  if printf '%s' "$procs" | grep -qE '(^|/)pi( |$)'; then
+  # LLM 우선 매칭 (LLM 이 떠 있으면 shell 도 같이 있는 게 정상).
+  # 기존 4개 grep(word-anchored / anthropic·openai / node-launched / pi)을
+  # 단일 -iE union 으로 통합하여 fork 4→1. case-insensitive 는 매칭을 넓힐 뿐 의미 동일.
+  if printf '%s' "$procs" | grep -qiE \
+      '(^|/)(claude|codex|gemini|opencode|omc|omo|omx|agy|antigravity|junie|pi)( |$)|anthropic|openai|node .*(claude|codex|gemini|agy|antigravity)'; then
     echo llm; return 0
   fi
 
-  # LLM 흔적 없음 → shell 이면 worker
-  if printf '%s' "$procs" | grep -qE '(^|/| )(zsh|bash|fish|dash|ksh|tcsh)( |$)'; then
-    echo worker; return 0
-  fi
-  # 일반 sh 매칭 (위 grep 가 -sh 도 잡으니 별도)
-  if printf '%s' "$procs" | grep -qE '(^|/)sh( |$)'; then
+  # LLM 흔적 없음 → shell 이면 worker. zsh/bash/.. 와 일반 sh 를 단일 union 으로 (fork 2→1).
+  if printf '%s' "$procs" | grep -qE '(^|/| )(zsh|bash|fish|dash|ksh|tcsh)( |$)|(^|/)sh( |$)'; then
     echo worker; return 0
   fi
 
@@ -272,13 +264,13 @@ _cmux_v5_llm_prompt() {
 $body
 
 [규칙 — 우선순위 순]
-1. Bash 호출 가능하면 마지막 Bash 도구 호출로 본문을 FIFO 에 heredoc 으로 쓸 것 (chat 출력 X):
+1. Bash 호출 가능하면 마지막 Bash 호출로 답변을 FIFO 에 기록 (chat 출력 X). 가운데 줄을 실제 답으로 교체, 비우지 말 것:
     cat > $fifo <<'$delim'
-    답변 본문
+    여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
     $delim
-2. Bash 호출 불가하면 답변을 chat 에 출력하되 첫 줄과 마지막 줄은 아래 마커를 정확히 그대로:
+2. Bash 호출 불가하면 chat 에 아래 두 마커 사이에 실제 답을 출력:
    === CMUX_${token}_BEGIN ===
-   답변 본문
+   여기에 실제 답변
    === CMUX_${token}_END ===
 - 답변은 간결하게.
 EOF
@@ -287,9 +279,10 @@ EOF
 $body
 
 [cmux]
-마지막 Bash 도구 호출로 답변 본문만 FIFO 에 작성. chat 출력 금지.
+반드시 마지막 Bash 도구 호출 1번으로 답변을 FIFO 에만 기록. chat 출력 금지.
+가운데 줄을 너의 실제 답변으로 교체하라 — 절대 비워두지 말 것:
 cat > $fifo <<'$delim'
-<답변 본문>
+여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
 $delim
 답변은 간결하게.
 EOF
@@ -298,22 +291,22 @@ EOF
       cat <<EOF
 $body
 
-[cmux] 답변은 짧게. 가능하면 Bash 도구 마지막 호출로 FIFO 에만 작성:
+[cmux] 답을 짧게. 가능하면 마지막 Bash 호출로 FIFO 에만 기록 — 가운데 줄을 실제 답으로 교체, 비우지 말 것:
 cat > $fifo <<'$delim'
-<answer>
+여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
 $delim
-Bash 불가하면 chat 에 아래 마커만 사용:
+Bash 불가하면 chat 에 아래 두 마커 사이에 실제 답을 출력:
 === CMUX_${token}_BEGIN ===
-<answer>
+여기에 실제 답변
 === CMUX_${token}_END ===
 EOF
     else
       cat <<EOF
 $body
 
-[cmux] 답변은 짧게. 마지막 Bash 도구 호출로 FIFO 에만 작성. chat 출력 금지:
+[cmux] 위 질문의 답을 짧게. 반드시 마지막 Bash 도구 호출 1번으로 아래 명령을 실행해 FIFO 파일에만 기록하라(chat 출력 금지). 첫/마지막 줄(구분자 $delim)은 그대로 두고, 가운데 줄을 너의 실제 답변으로 교체하라 — 절대 비워두지 말 것:
 cat > $fifo <<'$delim'
-<answer>
+여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
 $delim
 EOF
     fi
@@ -457,7 +450,11 @@ while (time < $deadline && $remaining > 0) {
             last;
         }
         if ($r == 0) {
-            # EOF
+            # EOF: writer 가 connect 후 close. macOS/BSD NONBLOCK FIFO 의미론상
+            # select->can_read 는 writer 가 실제로 접속한 뒤에만 readable 을 보고하므로,
+            # buf 가 비어 있는 EOF 도 "완료된 빈 응답"으로 즉시 처리한다 (rc=0).
+            # (재오픈하여 더 기다리면 side-effect-only worker·no-match grep·빈 응답이
+            #  timeout 까지 hang 되는 회귀가 발생하므로 절대 reopen 하지 않는다.)
             $rc = 0;
             last;
         }
@@ -792,10 +789,20 @@ cmux_collect() {
     esac
   done
 
-  # Mode 1: no target → multi-collect 모든 pending
+  # Mode 1: no target → multi-collect 모든 pending.
+  # 각 job 을 background 로 병렬 회수 → 총 대기시간 = max(개별) (기존 sum 대비 대폭 단축).
+  # zsh/bash 호환을 위해 셸 배열 대신 인덱스 파일($tmpd/$n.*) 사용.
   if [ -z "$target" ]; then
     _cmux_v5_init_dir
-    local found=0 worst=0 fifo
+    # zsh(nomatch ON)에서 빈 디렉토리 glob 이 함수를 abort 시키지 않도록 (bash 에선 무관).
+    # LOCAL_OPTIONS 로 함수 종료 시 원복.
+    [ -n "${ZSH_VERSION:-}" ] && setopt local_options no_nomatch 2>/dev/null
+    local tmpd
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-collect.XXXXXX")" || {
+      printf '[cmux v5] mktemp failed\n' >&2; return 1
+    }
+    # 지역변수 1회 선언 (zsh: 값 있는 변수의 무대입 `local` 재선언은 stdout 오염).
+    local found=0 n=0 fifo nm surface title hdr
     for fifo in "$CMUX_V5_FIFO_DIR"/*.res; do
       [ -e "$fifo" ] || continue
       # FIFO 가 아닌 잔재 (regular file 등) 는 그냥 unlink + 스킵.
@@ -807,7 +814,7 @@ cmux_collect() {
         continue
       fi
       found=1
-      local nm surface title hdr
+      n=$((n+1))
       nm="${fifo##*/}"
       surface="$(_cmux_v5_fifo_to_surface "$nm")"
       title=""
@@ -815,16 +822,40 @@ cmux_collect() {
       if [ -n "$title" ]; then hdr="$title ($surface)"
       elif [ -n "$surface" ]; then hdr="$surface"
       else hdr="${nm%.res}"; fi
-      printf '=== %s ===\n' "$hdr"
-      _cmux_v5_collect_one "$fifo" "$timeout" "$rmax"
-      local rc=$?
-      printf '\n'
-      [ "$rc" -ne 0 ] && worst="$rc"
+      printf '%s' "$hdr" > "$tmpd/$n.hdr"
+      # body→$n.out, status(stderr)→$n.err, rc→$n.rc 로 격리 후 background 회수.
+      ( _cmux_v5_collect_one "$fifo" "$timeout" "$rmax" > "$tmpd/$n.out" 2> "$tmpd/$n.err"
+        printf '%s' "$?" > "$tmpd/$n.rc" ) &
     done
+
     if [ "$found" -eq 0 ]; then
+      rm -rf "$tmpd"
       printf '[cmux v5] no pending jobs in %s\n' "$CMUX_V5_FIFO_DIR" >&2
       return 6
     fi
+
+    # collector 완료 대기 — 각 collector 가 마지막에 쓴 .rc sentinel 개수로 판정.
+    # `wait <pid>` 는 zsh 에서 이미 종료된 자식에 'job not found' 를 내므로 비사용.
+    # find 로 세어 glob nomatch 회피. 우리 tmpd 만 보므로 GC find·무관한 잡과 격리됨.
+    local _bdl=$(( $(date +%s) + timeout + 5 ))
+    while [ "$(find "$tmpd" -maxdepth 1 -name '*.rc' 2>/dev/null | wc -l | tr -d ' ')" -lt "$n" ]; do
+      [ "$(date +%s)" -ge "$_bdl" ] && break
+      sleep 0.1
+    done
+
+    # 원래 발견 순서대로 헤더/본문 출력 + worst rc 집계.
+    local worst=0 i=1 rc
+    while [ "$i" -le "$n" ]; do
+      [ -s "$tmpd/$i.err" ] && cat "$tmpd/$i.err" >&2
+      printf '=== %s ===\n' "$(cat "$tmpd/$i.hdr" 2>/dev/null)"
+      [ -f "$tmpd/$i.out" ] && cat "$tmpd/$i.out"
+      printf '\n'
+      rc=0
+      [ -f "$tmpd/$i.rc" ] && rc="$(cat "$tmpd/$i.rc" 2>/dev/null)"
+      [ "$rc" -ne 0 ] && worst="$rc"
+      i=$((i+1))
+    done
+    rm -rf "$tmpd"
     return "$worst"
   fi
 
@@ -999,25 +1030,27 @@ cmux_by_title() {
 
 # v3 helper 유지 — 같은 workspace 의 다른 surface 목록
 cmux_other_surfaces() {
-  local tree workspace
+  local tree
   tree="$(_cmux_v5_get_tree_focused)" || return 1
-  workspace="$(printf '%s\n' "$tree" \
-    | awk '/here/ { for (i=1;i<=NF;i++) if ($i ~ /workspace:[0-9]+/) { print $i; exit } }')"
-  [ -z "$workspace" ] && return 1
+  # 계층 트리를 단일 패스로 파싱: workspace 를 라인 진행에 따라 추적하고,
+  # 'here' 마커가 달린 surface(=self)와 그 workspace 를 식별한 뒤,
+  # 같은 workspace 의 다른 surface 만 출력한다. self 식별은 신뢰 불가한
+  # CMUX_SURFACE_ID(UUID) 대신 here 마커로 한다.
   printf '%s\n' "$tree" \
-    | awk -v ws="$workspace" -v self="${CMUX_SURFACE_ID:-}" '
-        /workspace:[0-9]+/ {
-          if (match($0, /workspace:[0-9]+/)) {
-            cur_ws = substr($0, RSTART, RLENGTH)
-          }
+    | awk '
+        match($0, /workspace:[0-9]+/) { cur = substr($0, RSTART, RLENGTH); next }
+        match($0, /surface:[0-9]+/) {
+          s = substr($0, RSTART, RLENGTH)
+          n++; order[n] = s; ws[s] = cur
+          if ($0 ~ /(^| )here( |$)/) { here_ws = cur; here_s = s }
         }
-        cur_ws == ws && /surface:[0-9]+/ {
-          if (match($0, /surface:[0-9]+/)) {
-            s = substr($0, RSTART, RLENGTH)
-            if (self == "" || index($0, self) == 0) print s
+        END {
+          if (here_ws == "") exit 0
+          for (i = 1; i <= n; i++) {
+            s = order[i]
+            if (ws[s] == here_ws && s != here_s && !seen[s]++) print s
           }
-        }
-      ' | sort -u
+        }'
 }
 
 # cmux_cross <target> [analyzer] <prompt> [--rounds N]
@@ -1032,7 +1065,13 @@ cmux_cross() {
   
   local target="$1" analyzer="" prompt="" rounds=3
   shift
-  
+
+  # 라운드마다 직전 답변($res/$feedback)을 프롬프트에 임베드하므로 cmux_ask 의
+  # PROMPT_MAX=500 캡에 걸려 전체가 중단됨 → 내부 호출은 cmux_ask_unsafe 로 우회.
+  # 응답은 CROSS_RESPONSE_MAX 로 캡하여 라운드 누적에 따른 토큰 무한증식을 차단.
+  local cross_pmax=1000000
+  local cross_rmax="${CMUX_V5_CROSS_RESPONSE_MAX:-16384}"
+
   # 만약 두 번째 인자가 --로 시작하지 않고, 세 번째 인자가 존재하면 analyzer로 판단
   if [[ "$1" != -* ]] && [ $# -ge 2 ]; then
     analyzer="$1"
@@ -1056,12 +1095,11 @@ cmux_cross() {
   # analyzer 자동 탐색
   if [ -z "$analyzer" ]; then
     # target이 아니고 본인(CMUX_SURFACE_ID)도 아닌 다른 LLM surface 탐색
-    local other
+    # (zsh: 값 있는 변수의 무대입 `local` 재선언은 stdout 오염 → 루프 밖 1회 선언)
+    local other resolved_other mode
     for other in $(cmux_other_surfaces); do
-      local resolved_other
       resolved_other="$(_cmux_v5_resolve "$other")"
       if [ "$resolved_other" != "$target" ] && [ "$resolved_other" != "${CMUX_SURFACE_ID:-}" ]; then
-        local mode
         mode="$(_cmux_v5_detect "$resolved_other")"
         if [ "$mode" = "llm" ]; then
           analyzer="$resolved_other"
@@ -1090,12 +1128,11 @@ cmux_cross() {
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
     printf '[cmux v5] [Round 0] Sending initial prompt to %s...\n' "$target" >&2
   fi
-  res=$(cmux_ask "$target" "$prompt") || return $?
+  res=$(cmux_ask_unsafe "$target" "$prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax") || return $?
   
-  local i
+  local i feedback_prompt target_prompt
   for ((i=1; i<=rounds; i++)); do
-    # Round i-1 검토 및 피드백 생성
-    local feedback_prompt
+    # Round i-1 검토 및 피드백 생성 (지역변수는 루프 밖에서 1회 선언; zsh stdout 오염 방지)
     if [ "$analyzer" = "$target" ]; then
       # Self-Refinement 피드백 프롬프트
       feedback_prompt="[cmux_cross Self-Refinement Round $i/$rounds]
@@ -1115,10 +1152,9 @@ $res
     if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
       printf '[cmux v5] [Round %d] Requesting review from %s...\n' "$i" "$analyzer" >&2
     fi
-    feedback=$(cmux_ask "$analyzer" "$feedback_prompt") || return $?
+    feedback=$(cmux_ask_unsafe "$analyzer" "$feedback_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax") || return $?
     
     # 피드백을 반영하여 target이 재답변
-    local target_prompt
     if [ "$analyzer" = "$target" ]; then
       target_prompt="[cmux_cross Self-Refinement Round $i/$rounds]
 스스로 분석한 개선 사항 및 피드백은 다음과 같습니다:
@@ -1136,7 +1172,7 @@ $feedback
     if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
       printf '[cmux v5] [Round %d] Sending feedback back to %s...\n' "$i" "$target" >&2
     fi
-    res=$(cmux_ask "$target" "$target_prompt") || return $?
+    res=$(cmux_ask_unsafe "$target" "$target_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax") || return $?
   done
   
   # 최종 요약 및 결론 도출
@@ -1160,5 +1196,124 @@ $res"
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
     printf '[cmux v5] Synthesizing final summary via %s...\n' "$analyzer" >&2
   fi
-  cmux_ask "$analyzer" "$final_prompt"
+  cmux_ask_unsafe "$analyzer" "$final_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax"
+}
+
+# cmux_broadcast <prompt> [target ...] [--mode m] [--timeout N] [--response-max N]
+#   멀티 에이전트 fan-out/fan-in. 지정한 대상(생략 시 같은 workspace 의 다른 LLM surface 전체)에
+#   동일 prompt 를 async 송신 후 병렬 수신한다. 응답은 surface 당 response-max 로 캡되어 토큰이 bound 되고,
+#   1-shot(라운드 없음)이라 무한 토큰 소요가 없다. cmux_cross(토론)와 달리 단순 동시 질의용.
+#   prompt 는 짧은 ask 용으로 PROMPT_MAX 캡을 따른다.
+cmux_broadcast() {
+  if [ $# -lt 1 ]; then
+    printf 'usage: cmux_broadcast <prompt> [target ...] [--mode m] [--timeout N] [--response-max N]\n' >&2
+    return 2
+  fi
+  local prompt="$1"; shift
+  # 모든 지역변수를 여기서 1회만 선언한다. zsh 는 값이 있는 변수를 `local`(대입 없이)로
+  # 재선언하면 'name=value' 를 stdout 에 출력하므로(typeset 표시 동작), 루프/블록 안에서
+  # 재선언하면 응답에 쓰레기가 섞인다. 따라서 절대 재선언하지 않는다.
+  local mode="" timeout="$CMUX_V5_TIMEOUT" rmax="$CMUX_V5_RESPONSE_MAX" targets=""
+  local s rs t job n=0 sent=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode)         mode="$2"; shift 2 ;;
+      --timeout)      timeout="$2"; shift 2 ;;
+      --response-max) rmax="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) printf '[cmux v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+      *)  targets="${targets}${1}
+"; shift ;;
+    esac
+  done
+  if [ "${#prompt}" -gt "$CMUX_V5_PROMPT_MAX" ]; then
+    printf '[cmux v5] prompt size %d > PROMPT_MAX=%d (broadcast 는 짧은 ask 용)\n' \
+      "${#prompt}" "$CMUX_V5_PROMPT_MAX" >&2
+    return 2
+  fi
+
+  # 대상 미지정 → 같은 workspace 의 다른 LLM surface 자동 수집
+  if [ -z "$targets" ]; then
+    for s in $(cmux_other_surfaces); do
+      rs="$(_cmux_v5_resolve "$s" 2>/dev/null)" || continue
+      [ -n "${CMUX_SURFACE_ID:-}" ] && [ "$rs" = "$CMUX_SURFACE_ID" ] && continue
+      if [ "$(_cmux_v5_detect "$rs")" = "llm" ]; then
+        targets="${targets}${rs}
+"
+      fi
+    done
+  fi
+  if [ -z "$targets" ]; then
+    printf '[cmux v5] broadcast: no target LLM surface found\n' >&2
+    return 6
+  fi
+
+  local tmpd
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-bcast.XXXXXX")" || {
+    printf '[cmux v5] mktemp failed\n' >&2; return 1
+  }
+
+  # 1) async fan-out — 각 대상에 비동기 송신, job 기록 (지역변수는 상단에서 이미 선언)
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    rs="$(_cmux_v5_resolve "$t" 2>/dev/null)" || {
+      printf '[cmux v5] broadcast: cannot resolve %s, skip\n' "$t" >&2; continue; }
+    if [ -n "$mode" ]; then
+      job="$(cmux_send "$rs" "$prompt" --mode "$mode" 2>/dev/null)"
+    else
+      job="$(cmux_send "$rs" "$prompt" 2>/dev/null)"
+    fi
+    [ -z "$job" ] && { printf '[cmux v5] broadcast: send failed on %s, skip\n' "$rs" >&2; continue; }
+    n=$((n+1))
+    printf '%s' "$rs"  > "$tmpd/$n.ref"
+    printf '%s' "$job" > "$tmpd/$n.job"
+    sent=$((sent+1))
+  done <<EOF
+$targets
+EOF
+
+  if [ "$sent" -eq 0 ]; then
+    rm -rf "$tmpd"
+    printf '[cmux v5] broadcast: no send succeeded\n' >&2
+    return 5
+  fi
+  if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+    printf '[cmux v5] broadcast: fan-out to %d surface(s), collecting in parallel...\n' "$sent" >&2
+  fi
+
+  # 2) parallel fan-in — job 단위 background 수집
+  local i=1
+  while [ "$i" -le "$n" ]; do
+    if [ -f "$tmpd/$i.job" ]; then
+      ( cmux_collect "$(cat "$tmpd/$i.job")" --timeout "$timeout" --response-max "$rmax" \
+          > "$tmpd/$i.out" 2> "$tmpd/$i.err"
+        printf '%s' "$?" > "$tmpd/$i.rc" ) &
+    fi
+    i=$((i+1))
+  done
+  # collector 완료 대기 — .rc sentinel 개수로 판정 (zsh `wait <pid>` 'job not found' 회피,
+  # glob nomatch 회피, 우리 tmpd 만 보므로 무관한 잡과 격리).
+  local _bdl=$(( $(date +%s) + timeout + 5 ))
+  while [ "$(find "$tmpd" -maxdepth 1 -name '*.rc' 2>/dev/null | wc -l | tr -d ' ')" -lt "$sent" ]; do
+    [ "$(date +%s)" -ge "$_bdl" ] && break
+    sleep 0.1
+  done
+
+  # 3) 송신 순서대로 헤더/본문 출력 + worst rc 집계
+  local worst=0 rc title ref
+  i=1
+  while [ "$i" -le "$n" ]; do
+    ref="$(cat "$tmpd/$i.ref" 2>/dev/null)"
+    title="$(_cmux_v5_surface_title "$ref" 2>/dev/null)"
+    [ -s "$tmpd/$i.err" ] && cat "$tmpd/$i.err" >&2
+    if [ -n "$title" ]; then printf '=== %s (%s) ===\n' "$title" "$ref"
+    else printf '=== %s ===\n' "$ref"; fi
+    [ -f "$tmpd/$i.out" ] && cat "$tmpd/$i.out"
+    printf '\n'
+    rc=0; [ -f "$tmpd/$i.rc" ] && rc="$(cat "$tmpd/$i.rc" 2>/dev/null)"
+    [ "$rc" -ne 0 ] && worst="$rc"
+    i=$((i+1))
+  done
+  rm -rf "$tmpd"
+  return "$worst"
 }
