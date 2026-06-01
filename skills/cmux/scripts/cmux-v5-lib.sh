@@ -18,13 +18,14 @@
 #   source /path/to/cmux-v5-lib.sh
 #   ANSWER=$(cmux_ask surface:9 "현재 브랜치만 알려줘")
 #   ANSWER=$(cmux_ask "codex" "git log -5 --oneline" --mode worker)
-#   job=$(cmux_send "codex" "build 끝나면 한 줄 요약")
+#   cmux_send "codex" "build 끝나면 한 줄 요약"
+#   job=$(cmux_send "codex" "build 끝나면 한 줄 요약" --no-watch)
 #   RESULT=$(cmux_collect "$job" --timeout 600)
 
 # ---- defaults (env override 가능) ----
 : "${CMUX_V5_PROMPT_MAX:=500}"      # prompt 글자 cap
 : "${CMUX_V5_RESPONSE_MAX:=4096}"   # 응답 바이트 cap
-: "${CMUX_V5_TIMEOUT:=1800}"        # 응답 대기(.ans 폴링) 최대 초 — 기본 30분
+: "${CMUX_V5_TIMEOUT:=1200}"        # 응답 대기(.ans 폴링) 최대 초 — 기본 20분
 : "${CMUX_V5_AUTO_CAP:=on}"         # on|off — prompt 끝에 안내문 자동 첨부
 : "${CMUX_V5_TREE_TTL:=3}"          # cmux tree 캐시 TTL(초). resolve→detect→dynamic 간 tree fork 재사용
 : "${CMUX_V5_FIFO_DIR:=/tmp/cmux-fifo}"
@@ -39,6 +40,9 @@
 : "${CMUX_V5_JOB_DIR:=/tmp/cmux-jobs}"     # job 레지스트리 루트
 : "${CMUX_V5_JOB_TTL_MIN:=720}"            # job 레코드 GC 분(기본 12h)
 : "${CMUX_V5_FLOW_MAX_NODES:=64}"          # cmux_flow DAG 노드 안전 상한
+: "${CMUX_V5_WORKER_FOCUS_GUARD:=on}" # on|off — focused/current worker surface 보호
+: "${CMUX_V5_CROSS_TIMEOUT:=1800}"    # cmux_cross per-hop timeout seconds
+: "${CMUX_V5_CROSS_TRANSCRIPT_MAX:=32768}" # cmux_cross 라운드 transcript prompt 삽입 cap(bytes)
 
 # ---- private ----
 
@@ -48,6 +52,7 @@ _CMUX_V5_TREE_FOCUSED_CACHE=""
 _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
 _CMUX_V5_GC_DONE=0
 _CMUX_V5_JOBGC_DONE=0
+CMUX_V5_LAST_TRUNCATED=0
 
 _cmux_v5_get_tree() {
   local now
@@ -73,21 +78,95 @@ _cmux_v5_get_tree_focused() {
   printf '%s\n' "$_CMUX_V5_TREE_FOCUSED_CACHE"
 }
 
-# title-or-ref → surface:N. 인자가 surface:N 패턴이면 그대로, 아니면 title lookup.
-# 다중 매치 시 첫 번째. 실패 시 stderr + rc 6.
+_cmux_v5_current_workspace() {
+  _cmux_v5_get_tree_focused \
+    | awk '
+        match($0, /workspace:[0-9]+/) { cur = substr($0, RSTART, RLENGTH) }
+        match($0, /surface:[0-9]+/) && $0 ~ /(^| )here( |$)/ {
+          if (cur != "") { print cur; exit }
+        }
+      '
+}
+
+_cmux_v5_workspace_surfaces() {
+  local ws="$1"
+  [ -z "$ws" ] && return 1
+  _cmux_v5_get_tree_focused \
+    | awk -v want="$ws" '
+        match($0, /workspace:[0-9]+/) {
+          cur = substr($0, RSTART, RLENGTH)
+          in_ws = (cur == want)
+          next
+        }
+        in_ws && match($0, /surface:[0-9]+/) {
+          print substr($0, RSTART, RLENGTH)
+        }
+      '
+}
+
+_cmux_v5_surface_in_current_workspace() {
+  local surface="$1" ws
+  ws="$(_cmux_v5_current_workspace)"
+  [ -z "$ws" ] && {
+    printf '[cmux v5] cannot identify current workspace. refusing cross-workspace send.\n' >&2
+    return 6
+  }
+  _cmux_v5_workspace_surfaces "$ws" | grep -qx "$surface"
+}
+
+_cmux_v5_resolve_in_current_workspace() {
+  local arg="$1" ws
+  ws="$(_cmux_v5_current_workspace)"
+  [ -z "$ws" ] && {
+    printf '[cmux v5] cannot identify current workspace. refusing cross-workspace send.\n' >&2
+    return 6
+  }
+
+  _cmux_v5_get_tree_focused \
+    | awk -v want_ws="$ws" -v q="$arg" '
+        function title(line) {
+          if (match(line, /"[^"]+"/)) return substr(line, RSTART+1, RLENGTH-2)
+          return ""
+        }
+        match($0, /workspace:[0-9]+/) {
+          cur_ws = substr($0, RSTART, RLENGTH)
+          in_ws = (cur_ws == want_ws)
+          pane_title = ""
+          next
+        }
+        !in_ws { next }
+        match($0, /pane:[0-9]+/) {
+          t = title($0)
+          if (t != "") pane_title = t
+          next
+        }
+        match($0, /surface:[0-9]+/) {
+          s = substr($0, RSTART, RLENGTH)
+          t = title($0)
+          if (q == s || q == t || q == pane_title) {
+            print s
+            exit
+          }
+        }
+      '
+}
+
+# title/pane-name/ref → surface:N. 모든 resolve 는 현재 workspace 안으로 제한한다.
+# 다중 매치 시 현재 workspace 내 첫 번째. 실패 시 stderr + rc 6.
 _cmux_v5_resolve() {
   local arg="$1"
-  if [[ "$arg" =~ ^surface:[0-9]+$ ]]; then
-    printf '%s' "$arg"
-    return 0
-  fi
   local ref
-  ref="$(_cmux_v5_get_tree \
-    | grep -F "\"$arg\"" \
-    | grep -oE 'surface:[0-9]+' \
-    | head -1)"
+  if [[ "$arg" =~ ^surface:[0-9]+$ ]]; then
+    if _cmux_v5_surface_in_current_workspace "$arg"; then
+      printf '%s' "$arg"
+      return 0
+    fi
+    printf '[cmux v5] refusing "%s" — target is not in the current workspace\n' "$arg" >&2
+    return 6
+  fi
+  ref="$(_cmux_v5_resolve_in_current_workspace "$arg")"
   if [ -z "$ref" ]; then
-    printf '[cmux v5] cannot resolve "%s" — not surface:N nor a matched title\n' "$arg" >&2
+    printf '[cmux v5] cannot resolve "%s" in current workspace — use a pane/surface title from this workspace\n' "$arg" >&2
     return 6
   fi
   printf '%s' "$ref"
@@ -108,6 +187,47 @@ _cmux_v5_job() {
 
 _cmux_v5_fifo_path() {
   printf '%s/%s.res' "$CMUX_V5_FIFO_DIR" "$1"
+}
+
+_cmux_v5_byte_len() {
+  LC_ALL=C wc -c | tr -d ' '
+}
+
+_cmux_v5_truncate_bytes() {
+  local max="$1"
+  perl -MEncode -0777 -e '
+    use strict;
+    use warnings;
+    my ($max) = @ARGV;
+    $max = $max + 0;
+    my $buf = <STDIN>;
+    $buf = "" unless defined $buf;
+    if (length($buf) > $max) {
+        $buf = substr($buf, 0, $max);
+        my $decoded = Encode::decode("UTF-8", $buf, Encode::FB_QUIET());
+        $buf = Encode::encode("UTF-8", $decoded);
+    }
+    print $buf;
+  ' "$max"
+}
+
+_cmux_v5_tail_bytes() {
+  local max="$1"
+  perl -MEncode -0777 -e '
+    use strict;
+    use warnings;
+    my ($max) = @ARGV;
+    $max = $max + 0;
+    my $buf = <STDIN>;
+    $buf = "" unless defined $buf;
+    if (length($buf) > $max) {
+        $buf = substr($buf, length($buf) - $max);
+        my $decoded = Encode::decode("UTF-8", $buf, Encode::FB_QUIET());
+        $buf = Encode::encode("UTF-8", $decoded);
+        $buf = "[... transcript truncated to latest ${max} bytes ...]\n" . $buf;
+    }
+    print $buf;
+  ' "$max"
 }
 
 _cmux_v5_garbage_collect() {
@@ -431,6 +551,13 @@ _cmux_v5_fifo_to_surface() {
   printf 'surface:%s' "$num"
 }
 
+_cmux_v5_job_in_current_workspace() {
+  local job="$1" surface
+  surface="$(_cmux_v5_fifo_to_surface "$job")"
+  [ -z "$surface" ] && return 0
+  _cmux_v5_surface_in_current_workspace "$surface"
+}
+
 # surface ref 가 현재 cmux tree 에 존재하는지. rc 0 = alive, 1 = gone.
 _cmux_v5_surface_alive() {
   local surface="$1"
@@ -445,6 +572,7 @@ _cmux_v5_pick_fifo() {
   [ -z "$surface" ] && return 1
   local prefix="${surface/:/_}"
   local f
+  # shellcheck disable=SC2045
   for f in $(ls -t "$CMUX_V5_FIFO_DIR/${prefix}-"*.res 2>/dev/null); do
     if [ -p "$f" ]; then printf '%s' "$f"; return 0; fi
   done
@@ -464,9 +592,42 @@ _cmux_v5_surface_title() {
         }'
 }
 
+_cmux_v5_surface_focus_line() {
+  local surface="$1"
+  [ -z "$surface" ] && return 1
+  _cmux_v5_get_tree_focused \
+    | awk -v s="$surface" 'index($0, s) > 0 { print; exit }'
+}
+
+_cmux_v5_surface_has_input_prompt() {
+  local surface="$1" screen last
+  [ -z "$surface" ] && return 1
+  screen="$(cmux read-screen --surface "$surface" --lines 8 2>/dev/null)" || return 1
+  last="$(printf '%s\n' "$screen" | tail -1)"
+  printf '%s\n' "$last" | grep -qiE '(User:|Input:|Prompt:|❯|>\s*$|[$#%][[:space:]]*$)'
+}
+
+_cmux_v5_worker_send_guard() {
+  local surface="$1" line prompt_note=""
+  [ "${CMUX_V5_WORKER_FOCUS_GUARD:-on}" = "off" ] && return 0
+  line="$(_cmux_v5_surface_focus_line "$surface")"
+  [ -z "$line" ] && return 0
+  case "$line" in
+    *"◀ active"*|*"◀ here"*|*"[focused]"*)
+      if _cmux_v5_surface_has_input_prompt "$surface"; then
+        prompt_note=" with an input prompt"
+      fi
+      printf '[cmux v5] refusing worker send to focused/active surface %s%s. set CMUX_V5_WORKER_FOCUS_GUARD=off to override.\n' \
+        "$surface" "$prompt_note" >&2
+      return 7
+      ;;
+  esac
+  return 0
+}
+
 # echo: llm | worker | unknown
 _cmux_v5_detect() {
-  local surface="$1" tty short leader args
+  local surface="$1" tty short
 
   # surface ref → tty. surface UUID 도 cmux tree 가 표시하므로 substring match
   tty="$(_cmux_v5_get_tree \
@@ -573,6 +734,7 @@ _cmux_v5_pick_ans() {
   local surface="$1"
   [ -z "$surface" ] && return 1
   local prefix="${surface/:/_}" f
+  # shellcheck disable=SC2045
   for f in $(ls -t "$CMUX_V5_FIFO_DIR/${prefix}-"*.ans 2>/dev/null); do
     [ -s "$f" ] && { printf '%s' "$f"; return 0; }
   done
@@ -718,6 +880,7 @@ PERL
 # dynamic read with sidecar status check and fallback
 _cmux_v5_read_fifo_dynamic() {
   local fifo="$1" surface="$2" mode="$3" timeout="$4" rmax="$5"
+  CMUX_V5_LAST_TRUNCATED=0
 
   if [ -n "$surface" ] && [ -z "$mode" ]; then
     mode="$(_cmux_v5_detect "$surface")"
@@ -751,15 +914,17 @@ _cmux_v5_read_fifo_dynamic() {
   fi
 
   local out
+  local meta
+  meta="$(mktemp "${TMPDIR:-/tmp}/cmux-read-meta.XXXXXX")" || return 5
   # 단 한 번의 perl 호출로 FIFO 읽기 및 early idle 감지 루프 전체를 위임
-  out="$(perl - "$fifo" "$surface" "$mode" "$timeout" "$rmax" "$early_idle" "$poll_interval" "$max_idle_checks" "$short" <<'PERL'
+  out="$(perl - "$fifo" "$surface" "$mode" "$timeout" "$rmax" "$early_idle" "$poll_interval" "$max_idle_checks" "$short" "$meta" <<'PERL'
 use strict;
 use warnings;
 use Fcntl qw(O_RDONLY O_NONBLOCK);
 use Time::HiRes qw(time sleep);
 use IO::Select;
 
-my ($fifo, $surface, $mode, $timeout, $rmax, $early_idle, $poll_interval, $max_idle_checks, $short) = @ARGV;
+my ($fifo, $surface, $mode, $timeout, $rmax, $early_idle, $poll_interval, $max_idle_checks, $short, $meta) = @ARGV;
 $timeout = $timeout + 0;
 $rmax = $rmax + 0;
 $early_idle = $early_idle + 0;
@@ -769,7 +934,10 @@ $max_idle_checks = $max_idle_checks + 0;
 my $start_time = time;
 my $deadline = $start_time + $timeout;
 my $buf = "";
-my $remaining = $rmax;
+my $read_limit = $rmax + 1;
+$read_limit = 1 if $read_limit < 1;
+my $remaining = $read_limit;
+my $truncated = 0;
 
 sysopen(my $fh, $fifo, O_RDONLY | O_NONBLOCK) or do {
     print STDERR "[cmux v5] open fail: $!\n";
@@ -845,11 +1013,37 @@ while (time < $deadline && $remaining > 0) {
     }
 }
 close $fh;
+
+my $read_bytes = length($buf);
+if ($read_bytes > $rmax) {
+    $truncated = 1;
+    $buf = substr($buf, 0, $rmax);
+    eval {
+        require Encode;
+        my $decoded = Encode::decode("UTF-8", $buf, Encode::FB_QUIET());
+        $buf = Encode::encode("UTF-8", $decoded);
+    };
+}
+if ($meta) {
+    if (open(my $mf, ">", $meta)) {
+        print $mf "truncated=$truncated\n";
+        close $mf;
+    }
+}
 print $buf;
 exit $rc;
 PERL
 )"
   local rc=$?
+  if [ -f "$meta" ]; then
+    local k v
+    while IFS='=' read -r k v; do
+      case "$k" in
+        truncated) CMUX_V5_LAST_TRUNCATED="$v" ;;
+      esac
+    done < "$meta"
+    rm -f "$meta"
+  fi
   printf '%s' "$out"
   return $rc
 }
@@ -870,6 +1064,9 @@ _cmux_v5_dispatch() {
     printf '[cmux v5] bad mode: %s\n' "$mode" >&2
     return 2
   fi
+  if [ "$mode" = "worker" ]; then
+    _cmux_v5_worker_send_guard "$surface" || return $?
+  fi
 
   local job fifo
   job="$(_cmux_v5_job "$surface")"
@@ -889,14 +1086,21 @@ _cmux_v5_dispatch() {
     return 5
   fi
 
-  local out rc start elapsed mark
+  local out rc start elapsed mark truncated
   start=$(date +%s)
   # 응답 수신은 .ans 파일 폴링(primary). FIFO(.res)는 pending-job 마커로만 쓰고
   # blocking read 하지 않는다 → 응답자가 reader 유무와 무관히 답을 쓰므로 안 멈춘다.
-  local ans="${fifo%.res}.ans" used_ans=0
+  local ans="${fifo%.res}.ans"
+  CMUX_V5_LAST_TRUNCATED=0
   out="$(_cmux_v5_await_ans "$ans" "$timeout" "$rmax" "$surface")"
   rc=$?
-  [ "$rc" -eq 0 ] && used_ans=1
+  truncated=0
+  if [ "$rc" -eq 0 ] && [ -f "$ans" ] \
+     && [ "$(wc -c < "$ans" 2>/dev/null | tr -d ' ')" -gt "$rmax" ]; then
+    truncated=1
+  fi
+  # shellcheck disable=SC2034
+  CMUX_V5_LAST_TRUNCATED="$truncated"
   elapsed=$(( $(date +%s) - start ))
   rm -f "$fifo" "$ans"
 
@@ -909,10 +1113,12 @@ _cmux_v5_dispatch() {
     token="$(_cmux_v5_screen_token "$job")"
     screen_out="$(_cmux_v5_screen_extract "$surface" "$token")"
     if [ -n "$screen_out" ]; then
-      if [ "${#screen_out}" -gt "$rmax" ]; then
-        out="${screen_out:0:$rmax}"
+      if [ "$(printf '%s' "$screen_out" | _cmux_v5_byte_len)" -gt "$rmax" ]; then
+        out="$(printf '%s' "$screen_out" | _cmux_v5_truncate_bytes "$rmax")"
+        truncated=1
       else
         out="$screen_out"
+        truncated=0
       fi
       rc=0
       used_screen=1
@@ -928,11 +1134,11 @@ _cmux_v5_dispatch() {
       *)   mark="rc=$rc" ;;
     esac
     [ "$used_screen" -eq 1 ] && mark="$mark,screen-fallback"
-    if [ "$rc" -eq 0 ] && [ "${#out}" -ge "$rmax" ]; then
+    if [ "$rc" -eq 0 ] && [ "$truncated" = "1" ]; then
       mark="$mark,truncated"
     fi
     printf '[cmux v5] %s (%s) %ds %dB %s\n' \
-      "$surface" "$mode" "$elapsed" "${#out}" "$mark" >&2
+      "$surface" "$mode" "$elapsed" "$(printf '%s' "$out" | _cmux_v5_byte_len)" "$mark" >&2
   fi
 
   printf '%s' "$out"
@@ -995,18 +1201,24 @@ cmux_ask_unsafe() {
 
 # ---- async fire-and-collect API ----
 
-# 송신만. fifo 생성 + cmux send. stdout=job_id, stderr=status.
-# cmux_send <surface> <prompt> [--mode llm|worker]
+# 송신 + 기본 watch. stdout=최종 응답, stderr=status.
+# cmux_send <surface> <prompt> [--mode llm|worker] [--timeout N] [--watch-interval N] [--response-max N]
+# cmux_send <surface> <prompt> --no-watch  # legacy async: stdout=job_id
 cmux_send() {
   if [ $# -lt 2 ]; then
-    printf 'usage: cmux_send <surface> <prompt> [--mode llm|worker]\n' >&2
+    printf 'usage: cmux_send <surface> <prompt> [--mode llm|worker] [--timeout N --watch-interval N --response-max N] [--no-watch]\n' >&2
     return 2
   fi
-  local surface="$1" prompt="$2" mode=""
+  local surface="$1" prompt="$2" mode="" watch=1 timeout="$CMUX_V5_TIMEOUT" watch_interval=5 rmax="$CMUX_V5_RESPONSE_MAX"
   shift 2
   while [ $# -gt 0 ]; do
     case "$1" in
       --mode) mode="$2"; shift 2 ;;
+      --watch) watch=1; shift ;;
+      --no-watch|--async) watch=0; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --watch-interval|--interval) watch_interval="$2"; shift 2 ;;
+      --response-max) rmax="$2"; shift 2 ;;
       *) printf '[cmux v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
     esac
   done
@@ -1024,6 +1236,9 @@ cmux_send() {
     printf '[cmux v5] cannot auto-detect sidecar on %s. use --mode llm|worker.\n' \
       "$surface" >&2
     return 3
+  fi
+  if [ "$mode" = "worker" ]; then
+    _cmux_v5_worker_send_guard "$surface" || return $?
   fi
 
   local job fifo
@@ -1046,6 +1261,10 @@ cmux_send() {
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
     printf '[cmux v5] %s (%s) sent, job=%s\n' "$surface" "$mode" "$job" >&2
   fi
+  if [ "$watch" -eq 1 ]; then
+    cmux_watch "$job" --timeout "$timeout" --interval "$watch_interval" --response-max "$rmax"
+    return $?
+  fi
   printf '%s' "$job"
 }
 
@@ -1067,15 +1286,21 @@ _cmux_v5_collect_one() {
     return 0
   fi
 
-  local out rc start elapsed mark
+  local out rc start elapsed mark truncated keep_fifo
   start=$(date +%s)
   # 응답 수신은 .ans 파일 폴링(primary). FIFO(.res)는 pending-job 마커로만.
-  local ans="${fifo%.res}.ans" used_ans=0
+  local ans="${fifo%.res}.ans"
+  CMUX_V5_LAST_TRUNCATED=0
   out="$(_cmux_v5_await_ans "$ans" "$timeout" "$rmax" "$surface")"
   rc=$?
-  [ "$rc" -eq 0 ] && used_ans=1
+  truncated=0
+  if [ "$rc" -eq 0 ] && [ -f "$ans" ] \
+     && [ "$(wc -c < "$ans" 2>/dev/null | tr -d ' ')" -gt "$rmax" ]; then
+    truncated=1
+  fi
+  # shellcheck disable=SC2034
+  CMUX_V5_LAST_TRUNCATED="$truncated"
   elapsed=$(( $(date +%s) - start ))
-  rm -f "$fifo" "$ans"
 
   # Fallback B: 그래도 비었고 surface 알면 screen 마커 추출 시도(opt-in).
   local used_screen=0
@@ -1087,15 +1312,23 @@ _cmux_v5_collect_one() {
     screen_out="$(_cmux_v5_screen_extract "$surface" "$token")"
     if [ -n "$screen_out" ]; then
       # rmax 캡 적용
-      if [ "${#screen_out}" -gt "$rmax" ]; then
-        out="${screen_out:0:$rmax}"
+      if [ "$(printf '%s' "$screen_out" | _cmux_v5_byte_len)" -gt "$rmax" ]; then
+        out="$(printf '%s' "$screen_out" | _cmux_v5_truncate_bytes "$rmax")"
+        truncated=1
       else
         out="$screen_out"
+        truncated=0
       fi
       rc=0
       used_screen=1
     fi
   fi
+
+  keep_fifo=0
+  if [ "$rc" -eq 124 ] && [ "$used_screen" -eq 0 ]; then
+    keep_fifo=1
+  fi
+  [ "$keep_fifo" -eq 0 ] && rm -f "$fifo" "$ans"
 
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
     case "$rc" in
@@ -1105,11 +1338,12 @@ _cmux_v5_collect_one() {
       *)   mark="rc=$rc" ;;
     esac
     [ "$used_screen" -eq 1 ] && mark="$mark,screen-fallback"
-    if [ "$rc" -eq 0 ] && [ "${#out}" -ge "$rmax" ]; then mark="$mark,truncated"; fi
+    [ "$keep_fifo" -eq 1 ] && mark="$mark,preserved"
+    if [ "$rc" -eq 0 ] && [ "$truncated" = "1" ]; then mark="$mark,truncated"; fi
     if [ -n "$surface" ]; then
-      printf '[cmux v5] collect %s (%s) %ds %dB %s\n' "$surface" "$job" "$elapsed" "${#out}" "$mark" >&2
+      printf '[cmux v5] collect %s (%s) %ds %dB %s\n' "$surface" "$job" "$elapsed" "$(printf '%s' "$out" | _cmux_v5_byte_len)" "$mark" >&2
     else
-      printf '[cmux v5] collect %s %ds %dB %s\n' "$job" "$elapsed" "${#out}" "$mark" >&2
+      printf '[cmux v5] collect %s %ds %dB %s\n' "$job" "$elapsed" "$(printf '%s' "$out" | _cmux_v5_byte_len)" "$mark" >&2
     fi
   fi
   printf '%s' "$out"
@@ -1161,10 +1395,16 @@ cmux_collect() {
         fi
         continue
       fi
-      found=1
-      n=$((n+1))
       nm="${fifo##*/}"
       surface="$(_cmux_v5_fifo_to_surface "$nm")"
+      if [ -n "$surface" ] && ! _cmux_v5_surface_in_current_workspace "$surface"; then
+        if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+          printf '[cmux v5] skip %s — surface %s is not in the current workspace\n' "${nm%.res}" "$surface" >&2
+        fi
+        continue
+      fi
+      found=1
+      n=$((n+1))
       title=""
       [ -n "$surface" ] && title="$(_cmux_v5_surface_title "$surface")"
       if [ -n "$title" ]; then hdr="$title ($surface)"
@@ -1233,6 +1473,12 @@ cmux_collect() {
   local direct_fifo
   direct_fifo="$(_cmux_v5_fifo_path "$target")"
   if [ -p "$direct_fifo" ]; then
+    local direct_surface
+    direct_surface="$(_cmux_v5_fifo_to_surface "$target")"
+    if [ -n "$direct_surface" ] && ! _cmux_v5_surface_in_current_workspace "$direct_surface"; then
+      printf '[cmux v5] refusing collect for %s — job surface is not in the current workspace\n' "$target" >&2
+      return 6
+    fi
     _cmux_v5_collect_one "$direct_fifo" "$timeout" "$rmax"
     return $?
   fi
@@ -1276,6 +1522,73 @@ cmux_collect() {
   _cmux_v5_collect_one "$fifo" "$timeout" "$rmax"
 }
 
+# cmux_watch <job> [--timeout N] [--interval N] [--response-max N]
+#   short collect loop. rc=124 preserves FIFO and retries until total timeout.
+#   stdout only receives the terminal result, not repeated partial reads.
+cmux_watch() {
+  [ $# -ge 1 ] || { printf 'usage: cmux_watch <job> [--timeout N] [--interval N] [--response-max N]\n' >&2; return 2; }
+  local job="$1" timeout="$CMUX_V5_TIMEOUT" interval=5 rmax="$CMUX_V5_RESPONSE_MAX"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout)      timeout="$2"; shift 2 ;;
+      --interval|--watch-interval) interval="$2"; shift 2 ;;
+      --response-max) rmax="$2"; shift 2 ;;
+      *) printf '[cmux v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+
+  local deadline now remaining slice out_file accum_file rc bytes
+  deadline=$(( $(date +%s) + timeout ))
+  out_file="$(mktemp "${TMPDIR:-/tmp}/cmux-watch.XXXXXX")" || return 5
+  accum_file="$(mktemp "${TMPDIR:-/tmp}/cmux-watch-accum.XXXXXX")" || {
+    rm -f "$out_file"
+    return 5
+  }
+  while :; do
+    now="$(date +%s)"
+    remaining=$(( deadline - now ))
+    if [ "$remaining" -le 0 ]; then
+      rm -f "$out_file" "$accum_file"
+      if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+        printf '[cmux v5] watch %s timeout after %ss\n' "$job" "$timeout" >&2
+      fi
+      return 124
+    fi
+
+    slice="$interval"
+    [ "$slice" -gt "$remaining" ] && slice="$remaining"
+    : > "$out_file"
+    cmux_collect "$job" --timeout "$slice" --response-max "$rmax" > "$out_file"
+    rc=$?
+    case "$rc" in
+      0)
+        cat "$out_file" >> "$accum_file"
+        cat "$accum_file"
+        rm -f "$out_file" "$accum_file"
+        return 0
+        ;;
+      124)
+        cat "$out_file" >> "$accum_file"
+        if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+          bytes="$(wc -c < "$out_file" | tr -d ' ')"
+          if [ "$bytes" -gt 0 ]; then
+            printf '[cmux v5] watch %s waiting, %dB partial buffered\n' "$job" "$bytes" >&2
+          else
+            printf '[cmux v5] watch %s waiting\n' "$job" >&2
+          fi
+        fi
+        ;;
+      *)
+        cat "$out_file" >> "$accum_file"
+        cat "$accum_file"
+        rm -f "$out_file" "$accum_file"
+        return "$rc"
+        ;;
+    esac
+  done
+}
+
 # non-blocking 체크. rc: 0=data ready, 1=not yet (or timed out), 2=no such job.
 # cmux_check <job> [--wait N] [--poll-interval F]
 #   --wait N         : N초까지 폴링 후에도 안 도착이면 rc=1. 도착 즉시 rc=0.
@@ -1293,6 +1606,10 @@ cmux_check() {
   done
   local fifo ans
   fifo="$(_cmux_v5_fifo_path "$job")"
+  if ! _cmux_v5_job_in_current_workspace "$job"; then
+    printf '[cmux v5] refusing check for %s — job surface is not in the current workspace\n' "$job" >&2
+    return 2
+  fi
   ans="${fifo%.res}.ans"
   # pending 마커(.res)도 .ans 도 없으면 그런 job 없음.
   { [ -p "$fifo" ] || [ -e "$ans" ]; } || return 2
@@ -1325,6 +1642,10 @@ cmux_tail() {
   done
   local fifo
   fifo="$(_cmux_v5_fifo_path "$job")"
+  if ! _cmux_v5_job_in_current_workspace "$job"; then
+    printf '[cmux v5] refusing tail for %s — job surface is not in the current workspace\n' "$job" >&2
+    return 6
+  fi
   if [ ! -p "$fifo" ]; then
     printf '[cmux v5] no such job: %s\n' "$job" >&2
     return 6
@@ -1407,6 +1728,10 @@ cmux_cancel() {
   done
   local fifo esc_note=""
   fifo="$(_cmux_v5_fifo_path "$job")"
+  if ! _cmux_v5_job_in_current_workspace "$job"; then
+    printf '[cmux v5] refusing cancel for %s — job surface is not in the current workspace\n' "$job" >&2
+    return 6
+  fi
   [ -p "$fifo" ] && rm -f "$fifo"
   if [ -n "$surface" ]; then
     surface="$(_cmux_v5_resolve "$surface")" || return 6
@@ -1450,17 +1775,17 @@ cmux_other_surfaces() {
         }'
 }
 
-# cmux_cross <target> [analyzer] <prompt> [--rounds N]
+# cmux_cross <target> [analyzer] <prompt> [--rounds N] [--timeout N]
 #   target  : 토론/수행 주체 (예: codex)
 #   analyzer: 검토/분석 주체 (예: claude). 생략 시 다른 LLM surface 자동 탐색. 없으면 target과 동일 (Self-Refinement 모드)
 #   prompt  : 최초 지시 사항
 cmux_cross() {
   if [ $# -lt 2 ]; then
-    printf 'usage: cmux_cross <target> [analyzer] <prompt> [--rounds N]\n' >&2
+    printf 'usage: cmux_cross <target> [analyzer] <prompt> [--rounds N] [--timeout N]\n' >&2
     return 2
   fi
   
-  local target="$1" analyzer="" prompt="" rounds=3
+  local target="$1" analyzer="" prompt="" rounds=3 timeout="${CMUX_V5_CROSS_TIMEOUT:-1800}"
   shift
 
   # 라운드마다 직전 답변($res/$feedback)을 프롬프트에 임베드하므로 cmux_ask 의
@@ -1482,6 +1807,7 @@ cmux_cross() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --rounds) rounds="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
       *) printf '[cmux v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
     esac
   done
@@ -1516,84 +1842,183 @@ cmux_cross() {
   fi
   
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
-    printf '[cmux v5] starting cmux_cross: target=%s, analyzer=%s, rounds=%d\n' "$target" "$analyzer" "$rounds" >&2
+    printf '[cmux v5] starting cmux_cross: target=%s, analyzer=%s, rounds=%d, timeout=%ss\n' "$target" "$analyzer" "$rounds" "$timeout" >&2
   fi
   
-  local res="" feedback=""
+  local res="" feedback="" transcript="" transcript_context=""
+  local cross_tmax="${CMUX_V5_CROSS_TRANSCRIPT_MAX:-32768}"
   
   # Round 0: 최초 송신
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
     printf '[cmux v5] [Round 0] Sending initial prompt to %s...\n' "$target" >&2
   fi
-  res=$(cmux_ask_unsafe "$target" "$prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax") || return $?
+  res=$(cmux_ask_unsafe "$target" "$prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax" --timeout "$timeout") || return $?
+  transcript="[Original Objective]
+$prompt
+
+[Round 0 Target Initial Proposal]
+$res"
   
   local i feedback_prompt target_prompt
   for ((i=1; i<=rounds; i++)); do
+    transcript_context="$(printf '%s' "$transcript" | _cmux_v5_tail_bytes "$cross_tmax")"
     # Round i-1 검토 및 피드백 생성 (지역변수는 루프 밖에서 1회 선언; zsh stdout 오염 방지)
     if [ "$analyzer" = "$target" ]; then
       # Self-Refinement 피드백 프롬프트
-      feedback_prompt="[cmux_cross Self-Refinement Round $i/$rounds]
-이전 답변을 제공하셨습니다:
+      feedback_prompt="[cmux_cross Self-Refinement / Critic Round $i/$rounds]
+당신은 지금 같은 LLM 안의 '비판자(Critic)' 역할입니다. 사람에게 질문하지 말고, 필요한 가정은 명시하세요.
+
+[원래 설계 목표]
+$prompt
+
+[현재까지의 토론 기록]
+$transcript_context
+
+[검토 대상: 직전 설계자 답변]
 $res
 
-현재 작업 폴더의 코드베이스를 다시 정밀 검토하여, 위 답변의 잠재적인 오류, 누락된 엣지 케이스, 또는 아키텍처적 개선점 3가지를 스스로 도출하고 더 나은 개선안을 제시해 주세요."
+위 설계 목표와 토론 기록을 기준으로 비판 의견을 작성하세요.
+반드시 다음 구조를 포함하세요:
+1. 동의하는 핵심
+2. 반대/위험/누락
+3. 설계 목적을 더 날카롭게 만드는 재정의
+4. 다음 설계자 답변이 반드시 반영해야 할 요구사항
+5. 불확실하지만 사람에게 묻지 않고 둘 가정"
     else
       # 제3자 분석 피드백 프롬프트
-      feedback_prompt="[cmux_cross Feedback Round $i/$rounds]
-상대방($target)이 최초 지시사항에 대해 아래와 같이 답변했습니다:
+      feedback_prompt="[cmux_cross Cross-LLM Review Round $i/$rounds]
+당신은 검토자($analyzer)입니다. 사람에게 질문하지 말고, 필요한 가정은 명시하세요.
+
+[원래 설계 목표]
+$prompt
+
+[현재까지의 토론 기록]
+$transcript_context
+
+[검토 대상: 상대방($target)의 직전 답변]
 $res
 
-현재 작업 폴더의 코드베이스 사실 관계와 대조 분석하여, 상대방 답변의 오류, 개선 포인트, 혹은 추가 요구사항을 구체적으로 지적하는 피드백 의견을 작성해 주세요."
+위 설계 목표와 토론 기록을 기준으로 상대방의 설계를 검토하세요.
+반드시 다음 구조를 포함하세요:
+1. 동의하는 핵심
+2. 반대/위험/누락
+3. 설계 목적을 더 날카롭게 만드는 재정의
+4. 다음 target 답변이 반드시 반영해야 할 요구사항
+5. 불확실하지만 사람에게 묻지 않고 둘 가정"
     fi
     
     if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
       printf '[cmux v5] [Round %d] Requesting review from %s...\n' "$i" "$analyzer" >&2
     fi
-    feedback=$(cmux_ask_unsafe "$analyzer" "$feedback_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax") || return $?
+    feedback=$(cmux_ask_unsafe "$analyzer" "$feedback_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax" --timeout "$timeout") || return $?
+    transcript="$transcript
+
+[Round $i Analyzer/Critic Feedback]
+$feedback"
     
     # 피드백을 반영하여 target이 재답변
+    transcript_context="$(printf '%s' "$transcript" | _cmux_v5_tail_bytes "$cross_tmax")"
     if [ "$analyzer" = "$target" ]; then
-      target_prompt="[cmux_cross Self-Refinement Round $i/$rounds]
-스스로 분석한 개선 사항 및 피드백은 다음과 같습니다:
+      target_prompt="[cmux_cross Self-Refinement / Designer Round $i/$rounds]
+당신은 지금 같은 LLM 안의 '설계자(Designer)' 역할입니다. 비판자의 피드백을 검토하고 설계를 고도화하세요.
+
+[원래 설계 목표]
+$prompt
+
+[현재까지의 토론 기록]
+$transcript_context
+
+[직전 설계자 답변]
+$res
+
+[비판자 피드백]
 $feedback
 
-위 피드백과 개선 방향을 전면적으로 반영하여, 코드베이스 사실에 입각한 더 완벽한 결과물을 재작성해 주세요."
+사람에게 질문하지 말고, 필요한 가정은 명시하세요.
+반드시 다음 구조를 포함하세요:
+1. 피드백별 수용/부분수용/기각과 이유
+2. 고도화된 설계 목적
+3. 수정된 최종 설계안
+4. 남은 위험과 완화책
+5. 다음 라운드 검토자가 집중해야 할 쟁점"
     else
-      target_prompt="[cmux_cross Feedback Round $i/$rounds]
-검토자($analyzer)로부터 다음과 같은 분석 피드백을 수신했습니다:
+      target_prompt="[cmux_cross Cross-LLM Response Round $i/$rounds]
+당신은 설계자/수행자($target)입니다. 검토자($analyzer)의 피드백을 검토하고 설계를 고도화하세요.
+
+[원래 설계 목표]
+$prompt
+
+[현재까지의 토론 기록]
+$transcript_context
+
+[직전 target 답변]
+$res
+
+[검토자 피드백]
 $feedback
 
-위 피드백 지적 사항을 정밀 반영하여, 더 완벽한 코드베이스 개선안을 작성해 주세요."
+사람에게 질문하지 말고, 필요한 가정은 명시하세요.
+반드시 다음 구조를 포함하세요:
+1. 피드백별 수용/부분수용/기각과 이유
+2. 고도화된 설계 목적
+3. 수정된 최종 설계안
+4. 남은 위험과 완화책
+5. 다음 라운드 검토자가 집중해야 할 쟁점"
     fi
     
     if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
       printf '[cmux v5] [Round %d] Sending feedback back to %s...\n' "$i" "$target" >&2
     fi
-    res=$(cmux_ask_unsafe "$target" "$target_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax") || return $?
+    res=$(cmux_ask_unsafe "$target" "$target_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax" --timeout "$timeout") || return $?
+    transcript="$transcript
+
+[Round $i Target/Designer Response]
+$res"
   done
   
   # 최종 요약 및 결론 도출
   local final_prompt
+  transcript_context="$(printf '%s' "$transcript" | _cmux_v5_tail_bytes "$cross_tmax")"
   if [ "$analyzer" = "$target" ]; then
     final_prompt="[cmux_cross Final Summary]
-$rounds 회에 걸친 자가 개선(Self-Refinement)이 완료되었습니다.
-현재 최종 상태를 정리하고, 초기 버전 대비 어떤 점이 개선되었는지 핵심 요약을 포함하여 최종 결과물을 깔끔하게 요약해 주세요.
+$rounds 회에 걸친 자가 개선(Self-Refinement)이 완료되었습니다. 최종 답만 쓰지 말고, 비판자/설계자 사이의 의견 교환으로 설계 목적이 어떻게 고도화됐는지 드러내세요.
 
-[최종 답변]
-$res"
+[원래 설계 목표]
+$prompt
+
+[전체 토론 기록]
+$transcript_context
+
+반드시 다음 구조로 최종 산출물을 작성하세요:
+1. 원래 목표
+2. 라운드별 비판/수용/기각 요약
+3. 고도화된 설계 목적
+4. 최종 설계안
+5. 합의된 결정과 근거
+6. 남은 쟁점/리스크와 완화책"
   else
     final_prompt="[cmux_cross Final Summary]
-상대방($target)과의 $rounds 회 토론이 완료되었습니다.
-상대방의 최종 개선안과 이에 대한 귀하의 분석 결과를 토대로, 최종 코드베이스 개선 결론 및 요약을 마크다운 문서 형식으로 깔끔하게 작성해 주세요.
+상대방($target)과 검토자($analyzer)의 $rounds 회 교차 토론이 완료되었습니다. 최종 답만 쓰지 말고, 두 LLM 사이의 의견 교환으로 설계 목적이 어떻게 고도화됐는지 드러내세요.
 
-[상대방 최종 답변]
-$res"
+[원래 설계 목표]
+$prompt
+
+[전체 토론 기록]
+$transcript_context
+
+반드시 다음 구조로 최종 산출물을 작성하세요:
+1. 원래 목표
+2. 라운드별 검토자 피드백과 target의 수용/기각 요약
+3. 고도화된 설계 목적
+4. 최종 설계안
+5. 합의된 결정과 근거
+6. 남은 쟁점/리스크와 완화책"
   fi
   
   if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
     printf '[cmux v5] Synthesizing final summary via %s...\n' "$analyzer" >&2
   fi
-  cmux_ask_unsafe "$analyzer" "$final_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax"
+  cmux_ask_unsafe "$analyzer" "$final_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax" --timeout "$timeout"
 }
 
 # cmux_broadcast <prompt> [target ...] [--mode m] [--timeout N] [--response-max N]
@@ -1656,9 +2081,9 @@ cmux_broadcast() {
     rs="$(_cmux_v5_resolve "$t" 2>/dev/null)" || {
       printf '[cmux v5] broadcast: cannot resolve %s, skip\n' "$t" >&2; continue; }
     if [ -n "$mode" ]; then
-      job="$(cmux_send "$rs" "$prompt" --mode "$mode" 2>/dev/null)"
+      job="$(cmux_send "$rs" "$prompt" --mode "$mode" --no-watch 2>/dev/null)"
     else
-      job="$(cmux_send "$rs" "$prompt" 2>/dev/null)"
+      job="$(cmux_send "$rs" "$prompt" --no-watch 2>/dev/null)"
     fi
     [ -z "$job" ] && { printf '[cmux v5] broadcast: send failed on %s, skip\n' "$rs" >&2; continue; }
     n=$((n+1))
@@ -1946,6 +2371,7 @@ _cmux_v5_flow_render() {
 #   최종 stdout: 노드당 한 줄 `id\tSTATE\t<result bytes>` (위상 정렬 순).
 #   rc 0 = 전 노드 DONE, rc 1 = FAILED/CANCELLED 하나라도 있음.
 cmux_flow() {
+  # shellcheck disable=SC2034
   local src tmpd line id target deps prompt
   local nodes_n=0 i j
 
@@ -1998,6 +2424,7 @@ cmux_flow() {
   }
 
   if [ -n "$src" ]; then
+    # shellcheck disable=SC2094
     _cmux_v5_flow_parse "$src" "$tmpd" < "$src" || { rm -rf "$tmpd"; return 2; }
   else
     _cmux_v5_flow_parse "" "$tmpd" || { rm -rf "$tmpd"; return 2; }
@@ -2017,6 +2444,7 @@ cmux_flow() {
   fi
 
   # 2) dep 유효성 검사 — 모든 dep 이 알려진 node id 여야 한다.
+  # shellcheck disable=SC2034
   local di dj dd one found
   i=1
   while [ "$i" -le "$nodes_n" ]; do
@@ -2042,6 +2470,7 @@ cmux_flow() {
   # 3) 위상 정렬(Kahn 동등) — 사이클 검사 + 출력 순서 결정 동시에.
   #    placed[k]=1 표시 파일 + topo 순서 리스트($tmpd/topo, 노드 인덱스 한 줄씩).
   : > "$tmpd/topo"
+  # shellcheck disable=SC2034
   local placed_n=0 progress pk pdeps pd pall pidx
   while [ "$placed_n" -lt "$nodes_n" ]; do
     progress=0
@@ -2108,6 +2537,7 @@ cmux_flow() {
   #      - dep 중 FAILED/CANCELLED 있음 → CANCELLED 로 전파(newly_cancelled).
   #      - 모든 dep DONE → ready (병렬 dispatch 대상).
   #    ready 가 비고 PENDING 이 남았는데 newly_cancelled 도 없으면 deadlock 가드로 break.
+  # shellcheck disable=SC2034
   local wave_ready newly_cancelled st depst rdy_i pending_left ready_cnt dep_failed dep_all_done
   while :; do
     # 아직 PENDING 인 노드가 있는지 + ready / cancel 분류.
@@ -2339,8 +2769,8 @@ cmux_trace() {
   # 3) 표 출력.
   printf '%-16s %-10s %-14s %6s %6s %6s\n' \
     "NODE" "STATE" "TARGET" "WAIT" "EXEC" "TOTAL"
-  local _t nid st tgt ws es ts0 te0 ttl
-  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 te0; do
+  local _t nid st tgt ws es ts0 _te0 ttl
+  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 _te0; do
     [ -z "$nid" ] && continue
     printf '%-16s %-10s %-14s %6s %6s %6s\n' \
       "$nid" "$st" "$tgt" "$ws" "$es" "$ttl"
@@ -2354,7 +2784,7 @@ cmux_trace() {
     [ "$span" -lt 1 ] && span=1
   fi
   printf '\n%-16s |%s|\n' "GANTT" "$(_cmux_v5_obs_bar "$width" '-')"
-  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 te0; do
+  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 _te0; do
     [ -z "$nid" ] && continue
     local off=0 wlen=0 elen=0
     if _cmux_v5_obs_is_int "$ts0" && _cmux_v5_obs_is_int "$flow_min"; then
