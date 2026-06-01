@@ -33,6 +33,12 @@
 : "${CMUX_V5_PROMPT_STYLE:=compact}" # compact|verbose — LLM 수신 규칙 길이
 : "${CMUX_V5_EARLY_IDLE:=off}"      # off|worker|llm|on — 실패 조기 감지용 polling
 : "${CMUX_V5_POLL_INTERVAL:=1}"     # early-idle polling 간격
+: "${CMUX_V5_LOCK_DIR:=/tmp/cmux-locks}"   # advisory lock 디렉터리
+: "${CMUX_V5_LOCK_TTL:=300}"               # stale lock 판정 초(소유 PID 사망 OR age>TTL)
+: "${CMUX_V5_LOCK_WAIT:=10}"               # acquire 재시도 최대 대기 초
+: "${CMUX_V5_JOB_DIR:=/tmp/cmux-jobs}"     # job 레지스트리 루트
+: "${CMUX_V5_JOB_TTL_MIN:=720}"            # job 레코드 GC 분(기본 12h)
+: "${CMUX_V5_FLOW_MAX_NODES:=64}"          # cmux_flow DAG 노드 안전 상한
 
 # ---- private ----
 
@@ -41,6 +47,7 @@ _CMUX_V5_TREE_CACHE_TIME=0
 _CMUX_V5_TREE_FOCUSED_CACHE=""
 _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
 _CMUX_V5_GC_DONE=0
+_CMUX_V5_JOBGC_DONE=0
 
 _cmux_v5_get_tree() {
   local now
@@ -109,12 +116,290 @@ _cmux_v5_garbage_collect() {
   [ "$_CMUX_V5_GC_DONE" = "1" ] && return 0
   _CMUX_V5_GC_DONE=1
   find "$CMUX_V5_FIFO_DIR" -type p -mmin +720 -delete 2>/dev/null &
+  # stale lock 디렉터리 백스톱 정리: ts-file 내용 기반 stale 은 acquire 시 break 하므로
+  # 여기선 디렉터리 mtime 이 TTL 보다 오래된 *.lock 만 coarse 하게 제거.
+  [ -d "$CMUX_V5_LOCK_DIR" ] && find "$CMUX_V5_LOCK_DIR" -type d -name '*.lock' -mmin +$(( ${CMUX_V5_LOCK_TTL:-300} / 60 + 1 )) -exec rm -rf {} + 2>/dev/null &
 }
 
 _cmux_v5_init_dir() {
   [ -d "$CMUX_V5_FIFO_DIR" ] && { _cmux_v5_garbage_collect; return 0; }
   mkdir -p "$CMUX_V5_FIFO_DIR" && chmod 700 "$CMUX_V5_FIFO_DIR"
   _cmux_v5_garbage_collect
+}
+
+# ---- 이식형 advisory lock (mkdir 기반 mutex, stat 의존 X) ----
+
+# _cmux_v5_lock_path <name> -> 락 디렉터리 경로
+_cmux_v5_lock_path() { printf '%s/%s.lock' "$CMUX_V5_LOCK_DIR" "$1"; }
+
+# _cmux_v5_lock_is_stale <lockpath> -> stale 이면 0, 아니면 1.
+#   판정: 소유 PID 명시적 사망 OR (now - ts > TTL).
+#   ts 파일을 직접 읽어 비교하므로 stat 의 BSD/GNU 차이를 회피.
+#   주의: 락 획득은 mkdir → pid 기록 → ts 기록 순서(아래 _cmux_v5_lock)라,
+#   "막 태어나는 중"인 락은 pid 가 (대개) 살아있고 ts 만 잠깐 비어 있다.
+#   따라서 dead-pid 를 먼저 보고, 그 다음 빈/비정상 ts 는 stale 가 아니라
+#   '점유 중'으로 간주해야 born-window 경합(빈 ts 를 stale 로 오판→타 프로세스가
+#   살아있는 락을 rm 후 이중 획득)을 차단한다. pid 기록 전 크래시처럼
+#   pid·ts 모두 없는 진짜 좀비는 GC 의 mtime 백스톱이 정리한다.
+_cmux_v5_lock_is_stale() {
+  local lockpath="$1" pid ts now ttl
+  ttl="${CMUX_V5_LOCK_TTL:-300}"
+  pid="$(cat "$lockpath/pid" 2>/dev/null)"
+  # 소유 PID 가 기록돼 있고 그게 죽었으면 ts 유무와 무관하게 stale
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  ts="$(cat "$lockpath/ts" 2>/dev/null)"
+  # ts 가 비었거나 숫자가 아니면 = 막 태어나는 중(혹은 GC 가 처리) → 점유로 간주
+  case "$ts" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  now="$(date +%s)"
+  if [ $((now - ts)) -gt "$ttl" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# _cmux_v5_lock <name> [wait_secs]
+#   atomic mkdir 으로 락 획득. 점유 중이면 stale 검사→break 후 1회 재시도,
+#   아니면 0.2s 간격으로 wait_secs 까지 폴링. 성공 0, 타임아웃 1.
+#   획득 시 pid/ts 메타를 락 디렉터리 안에 기록.
+_cmux_v5_lock() {
+  local name="$1" wait_secs="${2:-${CMUX_V5_LOCK_WAIT:-10}}"
+  local lockpath now deadline
+  # 빈/슬래시 포함 name 은 락 디렉터리 밖 경로를 유발하므로 거부
+  case "$name" in ''|*/*) return 1 ;; esac
+  lockpath="$(_cmux_v5_lock_path "$name")"
+  # 락 루트 디렉터리 lazy init
+  mkdir -p "$CMUX_V5_LOCK_DIR" 2>/dev/null && chmod 700 "$CMUX_V5_LOCK_DIR" 2>/dev/null
+  deadline=$(( $(date +%s) + wait_secs ))
+  while :; do
+    # 핵심 mutex: 기존 디렉터리면 mkdir 가 원자적으로 실패.
+    if mkdir "$lockpath" 2>/dev/null; then
+      printf '%s' "$$" > "$lockpath/pid" 2>/dev/null
+      date +%s > "$lockpath/ts" 2>/dev/null
+      return 0
+    fi
+    # 점유 중 — stale 이면 break 후 1회 재시도.
+    if _cmux_v5_lock_is_stale "$lockpath"; then
+      rm -rf "$lockpath" 2>/dev/null
+      if mkdir "$lockpath" 2>/dev/null; then
+        printf '%s' "$$" > "$lockpath/pid" 2>/dev/null
+        date +%s > "$lockpath/ts" 2>/dev/null
+        return 0
+      fi
+    fi
+    # 마감 시각 초과면 타임아웃.
+    now="$(date +%s)"
+    [ "$now" -ge "$deadline" ] && return 1
+    sleep 0.2
+  done
+}
+
+# _cmux_v5_unlock <name>
+#   소유 PID($$) 일치할 때만 제거(타 프로세스 락 오삭제 방지). 항상 0 반환.
+_cmux_v5_unlock() {
+  local name="$1" lockpath pid
+  case "$name" in ''|*/*) return 0 ;; esac
+  lockpath="$(_cmux_v5_lock_path "$name")"
+  pid="$(cat "$lockpath/pid" 2>/dev/null)"
+  if [ "$pid" = "$$" ]; then
+    rm -rf "$lockpath" 2>/dev/null
+  fi
+  return 0
+}
+
+# ---- job 레지스트리 ----
+# DAG 스케줄러가 소비할 토대. 기존 public 함수/FIFO 동작과 완전 독립인 additive 레이어.
+# 디스크 레이아웃:
+#   $CMUX_V5_JOB_DIR/<jobid>/
+#     meta          # KEY=VALUE 라인 (grep 가능, JSON 이스케이프 회피)
+#     state         # 단일 토큰 (빠른 읽기용, meta 와 중복 저장)
+#     result        # 응답 본문 raw (이스케이프 없이 verbatim)
+#     events.ndjson # 한 줄당 {"ts":N,"from":"S","to":"S"} (필드가 통제되어 hand-built JSON 안전)
+# meta 파싱 규칙: 읽기는 `^KEY=` 첫 매치 라인을 grep 후 prefix strip.
+#   upsert 는 lock 하에 그 키 라인을 제외하고 재작성 후 KEY=VALUE 추가(temp+mv 원자 교체).
+#   값은 단일 라인만 허용(개행 포함 시 거부).
+
+# 유효 상태 집합. terminal: DONE FAILED CANCELLED.
+_CMUX_V5_JOB_STATES="PENDING DISPATCHING RUNNING DONE FAILED CANCELLED"
+
+# new_state 가 enum 에 속하면 0, 아니면 1.
+# zsh 는 unquoted $var 를 word-split 하지 않으므로(bash 와 차이), for-in 대신
+# 양쪽 끝을 공백으로 패딩한 case 매칭으로 토큰 포함 여부를 셸 무관하게 판정한다.
+_cmux_v5_job_valid_state() {
+  case " $_CMUX_V5_JOB_STATES " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# _cmux_v5_job_dir <jobid> -> $CMUX_V5_JOB_DIR/<jobid>. 빈/슬래시 jobid 거부(rc 1).
+_cmux_v5_job_dir() {
+  local jobid="$1"
+  case "$jobid" in ''|*/*) return 1 ;; esac
+  printf '%s/%s' "$CMUX_V5_JOB_DIR" "$jobid"
+}
+
+# _cmux_v5_job_new <jobid> <target> [deps] [deadline]
+#   job 디렉터리 + meta + state=PENDING + 빈 result + 최초 이벤트(from="" to="PENDING") 생성.
+#   lock 으로 create race 차단. 이미 존재하면 clobber 없이 rc 1.
+_cmux_v5_job_new() {
+  local jobid="$1" target="$2" deps="${3:-}" deadline="${4:-}"
+  local dir created now
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  # 단일 라인 보장: target/deps/deadline 에 개행 있으면 거부 (락 획득 전).
+  case "$target$deps$deadline" in *"
+"*) return 1 ;; esac
+  _cmux_v5_lock "job-$jobid" || return 1
+  if [ -d "$dir" ]; then
+    _cmux_v5_unlock "job-$jobid"
+    return 1
+  fi
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    _cmux_v5_unlock "job-$jobid"
+    return 1
+  fi
+  created="$(date +%s)"
+  now="$created"
+  {
+    printf 'id=%s\n' "$jobid"
+    printf 'target=%s\n' "$target"
+    printf 'prompt_hash=\n'
+    printf 'deps=%s\n' "$deps"
+    printf 'state=PENDING\n'
+    printf 'attempts=0\n'
+    printf 'created=%s\n' "$created"
+    printf 'deadline=%s\n' "$deadline"
+  } > "$dir/meta"
+  printf 'PENDING' > "$dir/state.tmp" && mv -f "$dir/state.tmp" "$dir/state"
+  : > "$dir/result"
+  printf '{"ts":%s,"from":"","to":"PENDING"}\n' "$now" > "$dir/events.ndjson"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_get <jobid> <key> -> meta 의 KEY 값(없으면 빈). 단일 라인 원자 읽기라 lock 불필요.
+_cmux_v5_job_get() {
+  local jobid="$1" key="$2" dir line
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -f "$dir/meta" ] || return 0
+  line="$(grep "^${key}=" "$dir/meta" 2>/dev/null | head -1)"
+  [ -z "$line" ] && return 0
+  printf '%s' "${line#*=}"
+}
+
+# _cmux_v5_job_state <jobid> -> state 파일의 현재 토큰(없으면 빈).
+_cmux_v5_job_state() {
+  local jobid="$1" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -f "$dir/state" ] || return 0
+  cat "$dir/state" 2>/dev/null
+}
+
+# _cmux_v5_job_set_meta <jobid> <key> <value>
+#   meta 의 KEY=VALUE 라인을 lock 하에 upsert(없으면 추가, 있으면 교체). 정확히 한 줄 보장.
+#   key 에 '=' 또는 개행 포함 시 rc 2. value 에 개행 포함 시 rc 2.
+_cmux_v5_job_set_meta() {
+  local jobid="$1" key="$2" value="$3" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  case "$key" in *'='*|*"
+"*) return 2 ;; esac
+  case "$value" in *"
+"*) return 2 ;; esac
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  # grep -v 는 전부 필터되면 rc 1 → && 체이닝 금지(단일키 파일에서 abort 방지).
+  grep -v "^${key}=" "$dir/meta" 2>/dev/null > "$dir/meta.tmp"
+  printf '%s=%s\n' "$key" "$value" >> "$dir/meta.tmp"
+  mv -f "$dir/meta.tmp" "$dir/meta"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_set_state <jobid> <new_state>
+#   enum 검증(아니면 rc 2). lock 하에 old 읽기 → state 파일 + meta state= 둘 다 갱신 →
+#   events.ndjson 에 이벤트 추가. 동일 상태 재기록도 이벤트를 그대로 append 한다(idempotent 비강제).
+_cmux_v5_job_set_state() {
+  local jobid="$1" new_state="$2" dir old now
+  _cmux_v5_job_valid_state "$new_state" || return 2
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  old="$(cat "$dir/state" 2>/dev/null)"
+  now="$(date +%s)"
+  # state 파일도 temp+mv 로 원자 교체 — lock-free reader 의 torn read 차단.
+  printf '%s' "$new_state" > "$dir/state.tmp" && mv -f "$dir/state.tmp" "$dir/state"
+  # meta 의 state= 라인 upsert (lock 재진입 회피 위해 인라인 처리).
+  grep -v "^state=" "$dir/meta" 2>/dev/null > "$dir/meta.tmp"
+  printf 'state=%s\n' "$new_state" >> "$dir/meta.tmp"
+  mv -f "$dir/meta.tmp" "$dir/meta"
+  printf '{"ts":%s,"from":"%s","to":"%s"}\n' "$now" "$old" "$new_state" >> "$dir/events.ndjson"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_incr_attempts <jobid> -> lock 하에 attempts+1 기록. 새 카운트 출력.
+_cmux_v5_job_incr_attempts() {
+  local jobid="$1" dir cur next line
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  line="$(grep "^attempts=" "$dir/meta" 2>/dev/null | head -1)"
+  cur="${line#*=}"
+  case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  next=$((cur + 1))
+  grep -v "^attempts=" "$dir/meta" 2>/dev/null > "$dir/meta.tmp"
+  printf 'attempts=%s\n' "$next" >> "$dir/meta.tmp"
+  mv -f "$dir/meta.tmp" "$dir/meta"
+  _cmux_v5_unlock "job-$jobid"
+  printf '%s' "$next"
+}
+
+# _cmux_v5_job_set_result <jobid> <body> -> result 파일에 body verbatim 기록(단일 writer 가정, 안전상 lock).
+_cmux_v5_job_set_result() {
+  local jobid="$1" body="$2" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  # result 도 원자 교체 — lock-free get_result 의 torn read 차단.
+  printf '%s' "$body" > "$dir/result.tmp" && mv -f "$dir/result.tmp" "$dir/result"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_get_result <jobid> -> result 파일 cat(없으면 빈).
+_cmux_v5_job_get_result() {
+  local jobid="$1" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -f "$dir/result" ] || return 0
+  cat "$dir/result" 2>/dev/null
+}
+
+# _cmux_v5_job_list [state] -> jobid(디렉터리 basename) 출력. state 인자 시 그 상태만 필터.
+_cmux_v5_job_list() {
+  local filter="${1:-}" d base st
+  [ -d "$CMUX_V5_JOB_DIR" ] || return 0
+  for d in "$CMUX_V5_JOB_DIR"/*; do
+    [ -d "$d" ] || continue
+    base="${d##*/}"
+    if [ -n "$filter" ]; then
+      st="$(cat "$d/state" 2>/dev/null)"
+      [ "$st" = "$filter" ] || continue
+    fi
+    printf '%s\n' "$base"
+  done
+}
+
+# _cmux_v5_job_gc -> TTL(분) 초과 job 디렉터리를 백그라운드 비차단 제거. 셸 세션당 1회만.
+#   -mindepth 1 로 루트 자체 삭제 방지(BSD-safe).
+_cmux_v5_job_gc() {
+  [ "$_CMUX_V5_JOBGC_DONE" = "1" ] && return 0
+  _CMUX_V5_JOBGC_DONE=1
+  [ -d "$CMUX_V5_JOB_DIR" ] || return 0
+  find "$CMUX_V5_JOB_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +"${CMUX_V5_JOB_TTL_MIN:-720}" -exec rm -rf {} + 2>/dev/null &
+  return 0
 }
 
 _cmux_v5_make_fifo() {
@@ -1072,8 +1357,8 @@ cmux_cross() {
   local cross_pmax=1000000
   local cross_rmax="${CMUX_V5_CROSS_RESPONSE_MAX:-16384}"
 
-  # 만약 두 번째 인자가 --로 시작하지 않고, 세 번째 인자가 존재하면 analyzer로 판단
-  if [[ "$1" != -* ]] && [ $# -ge 2 ]; then
+  # 두 번째 인자(분석자 후보)와 세 번째 인자(프롬프트) 모두 옵션(--)이 아닐 때만 analyzer로 판단
+  if [[ "$1" != -* ]] && [[ "${2:-}" != -* ]] && [ $# -ge 2 ]; then
     analyzer="$1"
     prompt="$2"
     shift 2
@@ -1316,4 +1601,814 @@ EOF
   done
   rm -rf "$tmpd"
   return "$worst"
+}
+
+# ---- P3 라우팅/로드밸런싱 ----
+# 호출자가 고정 surface 대신 CAPABILITY(@coding/@codex/@llm 등)를 타깃으로 지정하면
+# P1 job 레지스트리를 근거로 "같은 capability 중 가장 덜 바쁜 surface"를 골라준다.
+# 기존 public 함수와 완전 독립인 additive 레이어 — cmux_flow 의 @cap 해석 훅 하나만 연결한다.
+#
+# capability 모델:
+#   - surface 의 cap 태그는 title(우선) 기반. title 에 codex/claude/gemini/agy 포함 시 해당 태그,
+#     아니면 _cmux_v5_detect 결과(llm|worker)로 폴백. 매핑은 _cmux_v5_surface_cap 한 곳에 모은다.
+#   - selector @X 가 surface 에 매칭되는 규칙(가독성 우선, 한 곳):
+#       @llm    → _cmux_v5_detect == llm 인 모든 surface
+#       @worker → _cmux_v5_detect == worker 인 모든 surface
+#       @codex/@claude/@gemini/@agy(그 외) → cap 태그가 X 와 정확히 일치
+#   - self 라우팅 금지: agent 가 자기 자신(CMUX_SURFACE_ID)에게 일을 돌리는 것을 막기 위해
+#     후보에서 self 는 제외한다(cmux_other_surfaces 만 열거하므로 자연히 빠짐).
+
+# _cmux_v5_surface_cap <surface> -> capability 태그 1개 출력.
+#   title 을 소문자화하여 알려진 키워드를 태그로 매핑. 미스 시 detect(llm|worker)로 폴백.
+#   매핑 테이블은 이 case 한 곳에서만 관리(확장 용이).
+_cmux_v5_surface_cap() {
+  local surface="$1" title lower
+  [ -z "$surface" ] && return 1
+  title="$(_cmux_v5_surface_title "$surface")"
+  # 소문자화(BSD-safe: tr). title 이 비면 lower 도 빈 문자열.
+  lower="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    *codex*)  printf 'codex';  return 0 ;;
+    *claude*) printf 'claude'; return 0 ;;
+    *gemini*) printf 'gemini'; return 0 ;;
+    *agy*)    printf 'agy';    return 0 ;;
+  esac
+  # 알려진 title 키워드 없음 → 일반 클래스(llm|worker)로 폴백.
+  _cmux_v5_detect "$surface"
+}
+
+# _cmux_v5_cap_match <selector-without-@> <surface> -> 매칭이면 rc0, 아니면 rc1.
+#   가독성 우선 규칙: llm/worker 는 detect 클래스로, 그 외는 정확한 cap 태그로 비교.
+_cmux_v5_cap_match() {
+  local sel="$1" surface="$2"
+  case "$sel" in
+    llm|worker) [ "$(_cmux_v5_detect "$surface")" = "$sel" ] ;;
+    *)          [ "$(_cmux_v5_surface_cap "$surface")" = "$sel" ] ;;
+  esac
+}
+
+# _cmux_v5_busy_count <surface> -> 이 surface 를 target 으로 하는 in-flight(DISPATCHING|RUNNING)
+#   P1 job 수를 정수로 출력. 양쪽 target 을 _cmux_v5_resolve 로 정규화하여
+#   surface:6 과 그 surface 를 가리키는 title 이 같은 것으로 매칭되게 한다.
+#   항상 정수 출력(없으면 0) — 호출부의 산술 비교가 빈 값으로 깨지지 않도록.
+_cmux_v5_busy_count() {
+  local surface="$1" want count=0 job jt
+  [ -z "$surface" ] && { printf '0'; return 0; }
+  want="$(_cmux_v5_resolve "$surface" 2>/dev/null)" || want="$surface"
+  # DISPATCHING + RUNNING 두 상태를 한 스트림으로 합쳐 순회.
+  # bash 서브셸 변수 소실 회피: 파이프 대신 process substitution 으로 현재 셸에서 루프.
+  while IFS= read -r job; do
+    [ -z "$job" ] && continue
+    # P3 라우팅된 job 은 target 에 raw @cap 이 감사용으로 남아있고 실제 surface 는
+    # routed_to 에 있다. routed_to 우선, 없으면(=pre-P3/구체 target) target 폴백.
+    jt="$(_cmux_v5_job_get "$job" routed_to)"
+    [ -z "$jt" ] && jt="$(_cmux_v5_job_get "$job" target)"
+    [ -z "$jt" ] && continue
+    jt="$(_cmux_v5_resolve "$jt" 2>/dev/null)" || continue
+    [ "$jt" = "$want" ] && count=$((count + 1))
+  done < <( { _cmux_v5_job_list DISPATCHING; _cmux_v5_job_list RUNNING; } )
+  printf '%s' "$count"
+}
+
+# _cmux_v5_route <selector> [exclude_surface] -> 구체 surface:N 출력.
+#   - selector 가 @ 로 시작하지 않으면 passthrough: _cmux_v5_resolve 후 출력.
+#     단 exclude_surface 와 같게 resolve 되면 rc1(호출자가 다른 것을 원함).
+#   - @cap selector: 후보 = cmux_other_surfaces(self 제외). capability 규칙 매칭 +
+#     exclude_surface(resolved) 가 아닌 것만 필터. 그 중 busy_count 최소를 선택
+#     (동률 → 열거 순서상 첫 번째, stable). 없으면 rc1 + stderr 안내.
+_cmux_v5_route() {
+  local selector="$1" exclude="${2:-}"
+  local exclude_r=""
+  if [ -n "$exclude" ]; then
+    exclude_r="$(_cmux_v5_resolve "$exclude" 2>/dev/null)" || exclude_r="$exclude"
+  fi
+
+  # @ 로 시작하지 않으면 leading @ 분기 전에 resolve 하면 안 되므로 case 로 먼저 판정.
+  case "$selector" in
+    @*) : ;;
+    *)
+      local concrete
+      concrete="$(_cmux_v5_resolve "$selector")" || return 6
+      if [ -n "$exclude_r" ] && [ "$concrete" = "$exclude_r" ]; then
+        return 1
+      fi
+      printf '%s' "$concrete"
+      return 0
+      ;;
+  esac
+
+  # 여기부터 @cap 경로. 선행 '@' 제거한 selector 본문.
+  local sel="${selector#@}"
+  local best="" best_n="" cand cand_r bn
+  while IFS= read -r cand; do
+    [ -z "$cand" ] && continue
+    cand_r="$(_cmux_v5_resolve "$cand" 2>/dev/null)" || continue
+    # exclude 와 동일하면 스킵.
+    [ -n "$exclude_r" ] && [ "$cand_r" = "$exclude_r" ] && continue
+    # capability 규칙 매칭 아니면 스킵.
+    _cmux_v5_cap_match "$sel" "$cand_r" || continue
+    bn="$(_cmux_v5_busy_count "$cand_r")"
+    case "$bn" in ''|*[!0-9]*) bn=0 ;; esac
+    # strict < : 동률이면 교체하지 않아 열거 순서상 첫 번째가 stable 하게 유지.
+    if [ -z "$best" ] || [ "$bn" -lt "$best_n" ]; then
+      best="$cand_r"
+      best_n="$bn"
+    fi
+  done < <(cmux_other_surfaces)
+
+  if [ -z "$best" ]; then
+    printf '[cmux v5] route: no surface matches %s\n' "$selector" >&2
+    return 1
+  fi
+  printf '%s' "$best"
+  return 0
+}
+
+# _cmux_v5_route_retry <selector> <failed_surface> -> 같은 capability 의 *다른* surface 선택.
+#   thin wrapper: failed_surface 를 exclude 로 넘긴다. 구체 ref(@ 없음)면 대안이 없어 rc1.
+_cmux_v5_route_retry() {
+  _cmux_v5_route "$1" "$2"
+}
+
+# ---- cmux_flow (P2 DAG 스케줄러) ----
+# P1 job 레지스트리 위에 얹는 의존성 그래프 스케줄러. 기존 public 함수와 완전 독립인 additive 레이어.
+# stdin (또는 파일 인자) 의 TAB 구분 DSL 을 소비:
+#   <id>\t<target>\t<deps>\t<prompt>
+#   - id    : [A-Za-z0-9_-]+ (그 외 거부)
+#   - target: dispatch 로 그대로 전달되는 surface ref / title
+#   - deps  : 쉼표 구분 node id 목록, 또는 '-' (없음)
+#   - prompt: 4번째 필드부터 끝까지(내부 TAB 보존)
+#   '#' 주석/빈 줄 무시.
+# 동작:
+#   ready node(모든 dep DONE)를 파도(wave)마다 병렬 실행. 결과는 템플릿 치환으로 dependent 에 주입.
+#   실패는 격리: dep 이 FAILED/CANCELLED 인 node 는 CANCELLED 로 전파(cascade), 독립 분기는 계속.
+# 모든 노드↔서브셸 통신은 on-disk 레지스트리(lock 보호)로만 이뤄지므로 background &+wait 가 안전하다.
+
+# 프로세스 전역 카운터 — 같은 프로세스/같은 초 내 다중 cmux_flow 호출의 flowid 충돌 방지.
+_CMUX_V5_FLOW_COUNTER=0
+
+# _cmux_v5_flow_run_node <target> <prompt>
+#   실제 dispatch 본체. 테스트가 override 할 수 있도록 별도 tiny 함수로 분리(cmux_ask 인라인 금지).
+#   stdout=응답, rc=dispatch rc.
+_cmux_v5_flow_run_node() {
+  cmux_ask "$1" "$2"
+}
+
+# 콤마구분 문자열을 한 줄에 하나씩 출력(빈 토큰 제거). bash/zsh 양쪽에서 word-split 의존 없이 동작.
+# printf '%s' 는 마지막 토큰에 개행을 붙이지 않으므로 read 조건에 || [ -n "$_d" ] 추가.
+_cmux_v5_flow_split_deps() {
+  printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r _d; do
+    [ -n "$_d" ] && printf '%s\n' "$_d"
+  done
+}
+
+# _cmux_v5_flow_exec_node <flowid> <nodeid> <target> <prompt>
+#   단일 노드 실행: DISPATCHING → RUNNING → run_node 호출 → rc0 이면 result 기록 + DONE, 아니면 FAILED.
+#   background 서브셸에서 호출되며, 상태/결과는 전부 레지스트리에 기록한다.
+_cmux_v5_flow_exec_node() {
+  local flowid="$1" nodeid="$2" target="$3" prompt="$4"
+  local jobid out rc
+  jobid="${flowid}__${nodeid}"
+  # P3 훅: target 이 @cap 이면 dispatch 전에 구체 surface:N 으로 라우팅.
+  #   라우팅 실패 → dispatch 없이 FAILED. 성공 → routed_to 메타 기록 후 target 치환.
+  #   (DISPATCHING 진입 전에 처리해 node 가 자기 busy_count 에 잡히지 않게 한다.
+  #    원래 @cap target 메타는 감사용으로 보존하고 routed_to 에 결과를 적는다.)
+  case "$target" in
+    @*)
+      local routed
+      # 전역 route 락으로 동시 wave 의 라우터들을 직렬화. 라우팅 직후 같은 임계영역에서
+      # DISPATCHING 까지 기록해야 다음 라우터가 이 노드를 busy(DISPATCHING+RUNNING)로 보고
+      # 다른 surface 로 분산한다. 락이 없으면 동시 라우터가 같은 PENDING 스냅샷을 보고
+      # 모두 enum-first 를 골라 한 surface 로 쏠린다(스냅샷 레이스). run_node 같은
+      # 느린 작업은 아래에서 락 해제 후 수행하므로 wave 병렬성은 유지된다.
+      _cmux_v5_lock "cmux-route" 30
+      routed="$(_cmux_v5_route "$target")"
+      rc=$?
+      if [ "$rc" -ne 0 ] || [ -z "$routed" ]; then
+        _cmux_v5_unlock "cmux-route"
+        _cmux_v5_job_set_state "$jobid" FAILED
+        printf '[cmux v5] flow node %s: cannot route %s\n' "$nodeid" "$target" >&2
+        return 0
+      fi
+      _cmux_v5_job_set_meta "$jobid" routed_to "$routed"
+      target="$routed"
+      _cmux_v5_job_set_state "$jobid" DISPATCHING
+      _cmux_v5_unlock "cmux-route"
+      ;;
+    *)
+      _cmux_v5_job_set_state "$jobid" DISPATCHING
+      ;;
+  esac
+  _cmux_v5_job_set_state "$jobid" RUNNING
+  # rc/stdout 위생: local 대입 분리 (zsh 무대입 재선언 stdout 오염 회피는 상단 1회 선언으로 처리).
+  out="$(_cmux_v5_flow_run_node "$target" "$prompt")"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    _cmux_v5_job_set_result "$jobid" "$out"
+    _cmux_v5_job_set_state "$jobid" DONE
+  else
+    _cmux_v5_job_set_state "$jobid" FAILED
+  fi
+}
+
+# _cmux_v5_flow_render <flowid> <deps> <prompt>
+#   prompt 안의 {{ID.result}} 와 {{ID}} 토큰을 dep ID 의 result 로 치환(deps 만 대상).
+#   bash 파라미터 확장 ${//} 라 sed-style '&' 마법 없이 임의 바이트(& \ / " 등) 안전.
+#   치환된 prompt 를 stdout 으로 출력.
+_cmux_v5_flow_render() {
+  local flowid="$1" deps="$2" prompt="$3"
+  local d r
+  case "$deps" in ''|'-') printf '%s' "$prompt"; return 0 ;; esac
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    r="$(_cmux_v5_job_get_result "${flowid}__${d}")"
+    # .result 형식 먼저, 그 다음 bare {{ID}}. 패턴을 quote 하여 node id 를 literal 로 매칭.
+    prompt="${prompt//"{{${d}.result}}"/"$r"}"
+    prompt="${prompt//"{{${d}}}"/"$r"}"
+  done < <(_cmux_v5_flow_split_deps "$deps")
+  printf '%s' "$prompt"
+}
+
+# cmux_flow [file]
+#   stdin(또는 file 인자)에서 DAG DSL 을 읽어 파싱→사이클 검사→파도 스케줄링→최종 보고.
+#   최종 stdout: 노드당 한 줄 `id\tSTATE\t<result bytes>` (위상 정렬 순).
+#   rc 0 = 전 노드 DONE, rc 1 = FAILED/CANCELLED 하나라도 있음.
+cmux_flow() {
+  local src tmpd line id target deps prompt
+  local nodes_n=0 i j
+
+  # 0) 입력 소스 결정 (file 인자 우선, 없으면 stdin).
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    if [ ! -f "$1" ]; then
+      printf 'cmux_flow: no such file: %s\n' "$1" >&2
+      return 2
+    fi
+    src="$1"
+  else
+    src=""
+  fi
+
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-flow.XXXXXX")" || {
+    printf 'cmux_flow: mktemp failed\n' >&2; return 1
+  }
+
+  # 1) 파싱 — 노드를 인덱스별 temp 파일에 격리(zsh runtime 배열 함정 회피).
+  #    각 노드: $tmpd/<i>.id  .target  .deps  .prompt
+  #    중복 id 거부, id 문자셋 검증, deps='-' 정규화.
+  _cmux_v5_flow_parse() {
+    local _src="$1" _td="$2"
+    local _id _target _deps _prompt _n=0 _k _seen
+    while IFS="$(printf '\t')" read -r _id _target _deps _prompt || [ -n "$_id" ]; do
+      # 빈 줄/주석 스킵.
+      case "$_id" in ''|'#'*) continue ;; esac
+      # id 문자셋 검증.
+      case "$_id" in *[!A-Za-z0-9_-]*)
+        printf 'cmux_flow: invalid node id: %s\n' "$_id" >&2; return 2 ;;
+      esac
+      # 중복 id 검사.
+      _k=1
+      while [ "$_k" -le "$_n" ]; do
+        _seen="$(cat "$_td/$_k.id" 2>/dev/null)"
+        if [ "$_seen" = "$_id" ]; then
+          printf 'cmux_flow: duplicate node id: %s\n' "$_id" >&2; return 2
+        fi
+        _k=$((_k+1))
+      done
+      [ -z "$_deps" ] && _deps='-'
+      _n=$((_n+1))
+      printf '%s' "$_id"     > "$_td/$_n.id"
+      printf '%s' "$_target" > "$_td/$_n.target"
+      printf '%s' "$_deps"   > "$_td/$_n.deps"
+      printf '%s' "$_prompt" > "$_td/$_n.prompt"
+    done
+    printf '%s' "$_n" > "$_td/count"
+    return 0
+  }
+
+  if [ -n "$src" ]; then
+    _cmux_v5_flow_parse "$src" "$tmpd" < "$src" || { rm -rf "$tmpd"; return 2; }
+  else
+    _cmux_v5_flow_parse "" "$tmpd" || { rm -rf "$tmpd"; return 2; }
+  fi
+  nodes_n="$(cat "$tmpd/count" 2>/dev/null)"
+  case "$nodes_n" in ''|*[!0-9]*) nodes_n=0 ;; esac
+
+  if [ "$nodes_n" -eq 0 ]; then
+    rm -rf "$tmpd"
+    printf 'cmux_flow: no nodes parsed\n' >&2
+    return 2
+  fi
+  if [ "$nodes_n" -gt "$CMUX_V5_FLOW_MAX_NODES" ]; then
+    rm -rf "$tmpd"
+    printf 'cmux_flow: too many nodes (%d > MAX_NODES=%d)\n' "$nodes_n" "$CMUX_V5_FLOW_MAX_NODES" >&2
+    return 2
+  fi
+
+  # 2) dep 유효성 검사 — 모든 dep 이 알려진 node id 여야 한다.
+  local di dj dd one found
+  i=1
+  while [ "$i" -le "$nodes_n" ]; do
+    dd="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+    case "$dd" in '-'|'') i=$((i+1)); continue ;; esac
+    while IFS= read -r one; do
+      [ -z "$one" ] && continue
+      found=0
+      j=1
+      while [ "$j" -le "$nodes_n" ]; do
+        if [ "$(cat "$tmpd/$j.id" 2>/dev/null)" = "$one" ]; then found=1; break; fi
+        j=$((j+1))
+      done
+      if [ "$found" -eq 0 ]; then
+        printf 'cmux_flow: unknown dep "%s" referenced by node "%s"\n' "$one" "$(cat "$tmpd/$i.id" 2>/dev/null)" >&2
+        rm -rf "$tmpd"
+        return 2
+      fi
+    done < <(_cmux_v5_flow_split_deps "$dd")
+    i=$((i+1))
+  done
+
+  # 3) 위상 정렬(Kahn 동등) — 사이클 검사 + 출력 순서 결정 동시에.
+  #    placed[k]=1 표시 파일 + topo 순서 리스트($tmpd/topo, 노드 인덱스 한 줄씩).
+  : > "$tmpd/topo"
+  local placed_n=0 progress pk pdeps pd pall pidx
+  while [ "$placed_n" -lt "$nodes_n" ]; do
+    progress=0
+    i=1
+    while [ "$i" -le "$nodes_n" ]; do
+      if [ -f "$tmpd/$i.placed" ]; then i=$((i+1)); continue; fi
+      pdeps="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+      pall=1
+      case "$pdeps" in
+        '-'|'') : ;;
+        *)
+          while IFS= read -r pd; do
+            [ -z "$pd" ] && continue
+            # pd 의 노드 인덱스를 찾아 placed 여부 확인.
+            pidx=0
+            j=1
+            while [ "$j" -le "$nodes_n" ]; do
+              if [ "$(cat "$tmpd/$j.id" 2>/dev/null)" = "$pd" ]; then pidx="$j"; break; fi
+              j=$((j+1))
+            done
+            if [ "$pidx" -eq 0 ] || [ ! -f "$tmpd/$pidx.placed" ]; then pall=0; break; fi
+          done < <(_cmux_v5_flow_split_deps "$pdeps")
+          ;;
+      esac
+      if [ "$pall" -eq 1 ]; then
+        : > "$tmpd/$i.placed"
+        printf '%s\n' "$i" >> "$tmpd/topo"
+        placed_n=$((placed_n+1))
+        progress=1
+      fi
+      i=$((i+1))
+    done
+    if [ "$progress" -eq 0 ]; then
+      rm -rf "$tmpd"
+      printf 'cmux_flow: cycle detected\n' >&2
+      return 2
+    fi
+  done
+
+  # 4) flow id 할당 — epoch + $$ + 전역 카운터(같은 초/프로세스 충돌 방지). '__' 없는 single-underscore.
+  _CMUX_V5_FLOW_COUNTER=$(( ${_CMUX_V5_FLOW_COUNTER:-0} + 1 ))
+  local flowid
+  # tmpd 의 고유 suffix(mktemp 가 보장)를 flowid seed 로 재사용하면 서브셸 간 충돌 없음.
+  flowid="flow-$(basename "$tmpd")"
+
+  # 5) 노드별 job 등록 (state=PENDING). jobid = <flowid>__<nodeid>.
+  local nid ntarget ndeps njobid
+  i=1
+  while [ "$i" -le "$nodes_n" ]; do
+    nid="$(cat "$tmpd/$i.id" 2>/dev/null)"
+    ntarget="$(cat "$tmpd/$i.target" 2>/dev/null)"
+    ndeps="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+    njobid="${flowid}__${nid}"
+    if ! _cmux_v5_job_new "$njobid" "$ntarget" "$ndeps"; then
+      rm -rf "$tmpd"
+      printf 'cmux_flow: job registration failed for node %s\n' "$nid" >&2
+      return 1
+    fi
+    i=$((i+1))
+  done
+
+  # 6) 파도 루프 — PENDING 이 없어질 때까지.
+  #    각 패스: PENDING 노드를 스캔하여
+  #      - dep 중 FAILED/CANCELLED 있음 → CANCELLED 로 전파(newly_cancelled).
+  #      - 모든 dep DONE → ready (병렬 dispatch 대상).
+  #    ready 가 비고 PENDING 이 남았는데 newly_cancelled 도 없으면 deadlock 가드로 break.
+  local wave_ready newly_cancelled st depst rdy_i pending_left ready_cnt dep_failed dep_all_done
+  while :; do
+    # 아직 PENDING 인 노드가 있는지 + ready / cancel 분류.
+    pending_left=0
+    : > "$tmpd/ready"
+    newly_cancelled=0
+    i=1
+    while [ "$i" -le "$nodes_n" ]; do
+      njobid="${flowid}__$(cat "$tmpd/$i.id" 2>/dev/null)"
+      st="$(_cmux_v5_job_state "$njobid")"
+      if [ "$st" != "PENDING" ]; then i=$((i+1)); continue; fi
+      pending_left=1
+      ndeps="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+      # dep 상태 평가.
+      dep_failed=0; dep_all_done=1
+      case "$ndeps" in
+        '-'|'') : ;;
+        *)
+          while IFS= read -r one; do
+            [ -z "$one" ] && continue
+            depst="$(_cmux_v5_job_state "${flowid}__${one}")"
+            case "$depst" in
+              FAILED|CANCELLED) dep_failed=1; dep_all_done=0 ;;
+              DONE) : ;;
+              *) dep_all_done=0 ;;
+            esac
+          done < <(_cmux_v5_flow_split_deps "$ndeps")
+          ;;
+      esac
+      if [ "$dep_failed" -eq 1 ]; then
+        _cmux_v5_job_set_state "$njobid" CANCELLED
+        newly_cancelled=1
+      elif [ "$dep_all_done" -eq 1 ]; then
+        printf '%s\n' "$i" >> "$tmpd/ready"
+      fi
+      i=$((i+1))
+    done
+
+    # PENDING 이 더 없으면 종료.
+    if [ "$pending_left" -eq 0 ]; then break; fi
+
+    # ready 개수 확인.
+    ready_cnt="$(wc -l < "$tmpd/ready" 2>/dev/null | tr -d ' ')"
+    case "$ready_cnt" in ''|*[!0-9]*) ready_cnt=0 ;; esac
+
+    if [ "$ready_cnt" -eq 0 ]; then
+      # ready 없음: 이번 패스에 cancel 이 있었으면 다음 패스로 cascade, 아니면 deadlock 가드.
+      if [ "$newly_cancelled" -eq 1 ]; then
+        continue
+      else
+        break
+      fi
+    fi
+
+    # ready 노드 전부 병렬 dispatch 후 wave 단위 wait.
+    while IFS= read -r rdy_i; do
+      [ -z "$rdy_i" ] && continue
+      nid="$(cat "$tmpd/$rdy_i.id" 2>/dev/null)"
+      ntarget="$(cat "$tmpd/$rdy_i.target" 2>/dev/null)"
+      ndeps="$(cat "$tmpd/$rdy_i.deps" 2>/dev/null)"
+      prompt="$(cat "$tmpd/$rdy_i.prompt" 2>/dev/null)"
+      # 부모에서 템플릿 렌더(이 시점 dep 결과는 디스크에 존재).
+      prompt="$(_cmux_v5_flow_render "$flowid" "$ndeps" "$prompt")"
+      ( _cmux_v5_flow_exec_node "$flowid" "$nid" "$ntarget" "$prompt" ) &
+    done < "$tmpd/ready"
+    wait
+  done
+
+  # 7) 최종 보고 — topo 순서대로 id\tSTATE\t<result>. rc 집계.
+  local rc_all=0 tline tnid tjobid tstate tresult
+  while IFS= read -r tline; do
+    [ -z "$tline" ] && continue
+    tnid="$(cat "$tmpd/$tline.id" 2>/dev/null)"
+    tjobid="${flowid}__${tnid}"
+    tstate="$(_cmux_v5_job_state "$tjobid")"
+    tresult="$(_cmux_v5_job_get_result "$tjobid")"
+    printf '%s\t%s\t%d\n' "$tnid" "$tstate" "${#tresult}"
+    [ "$tstate" = "DONE" ] || rc_all=1
+  done < "$tmpd/topo"
+
+  rm -rf "$tmpd"
+  return "$rc_all"
+}
+
+# ---- P4 관측가능성 ----
+# P1 job 레지스트리(events.ndjson + meta) 위에 얹는 읽기 전용 관측 레이어.
+# 기존 P0~P3 / public 함수와 완전 독립인 additive 레이어 — 어떤 기존 함수도 수정하지 않는다.
+# jq 미사용: events.ndjson 의 필드 포맷이 통제되어 있으므로 grep -oE + 파라미터 확장으로 파싱한다.
+#   ts        : grep -oE '"ts":[0-9]+' | grep -oE '[0-9]+'
+#   to-state  : 특정 to-state 로 라인을 grep 해서 잡으므로 from/to 충돌이 없다.
+# BSD-safe: sort -n / grep -oE / printf / 정수 $(( )) 만 사용. bc·%N·GNU 전용 플래그 없음.
+
+# _cmux_v5_obs_first_ts <events-file> -> 첫 이벤트의 ts(없으면 빈). 생성/PENDING 시각.
+_cmux_v5_obs_first_ts() {
+  local f="$1" line
+  [ -f "$f" ] || return 0
+  line="$(head -1 "$f" 2>/dev/null)"
+  [ -z "$line" ] && return 0
+  printf '%s' "$line" | grep -oE '"ts":[0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+# _cmux_v5_obs_ts_to <events-file> <to-state-regex> -> 그 to-state 로의 첫 전이 ts(없으면 빈).
+#   라인을 "to":"X" 로 grep 한 뒤 ts 만 추출 → from 필드값에 절대 오염되지 않는다.
+_cmux_v5_obs_ts_to() {
+  local f="$1" pat="$2" line
+  [ -f "$f" ] || return 0
+  line="$(grep -E "\"to\":\"(${pat})\"" "$f" 2>/dev/null | head -1)"
+  [ -z "$line" ] && return 0
+  printf '%s' "$line" | grep -oE '"ts":[0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+# 정수 가드: 인자가 비었거나 숫자가 아니면 rc1(=값 없음). 산술 전 항상 통과시켜
+# 여전히 RUNNING 인 job(t_end 없음)에서 $(( )) 가 깨지지 않게 한다.
+_cmux_v5_obs_is_int() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+# _cmux_v5_obs_lines <file> -> 파일의 라인 수(부재/빈 파일이면 0). wc 의 stderr 에러 회피.
+_cmux_v5_obs_lines() {
+  local f="$1" n
+  [ -f "$f" ] || { printf '0'; return 0; }
+  n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+  _cmux_v5_obs_is_int "$n" || n=0
+  printf '%s' "$n"
+}
+
+# _cmux_v5_obs_bar <length> <fill-char> -> length 칸의 fill 문자 막대(0이면 빈 문자열).
+#   printf '%*s' 로 공백을 찍고 tr 로 치환(BSD-safe). length 가 음수/비정수면 빈 문자열.
+_cmux_v5_obs_bar() {
+  local n="$1" ch="$2"
+  _cmux_v5_obs_is_int "$n" || { printf ''; return 0; }
+  [ "$n" -le 0 ] && { printf ''; return 0; }
+  printf '%*s' "$n" '' | tr ' ' "$ch"
+}
+
+# cmux_trace <flowid|jobid>
+#   <flowid>__ 로 시작하는 모든 job(또는 단일 jobid)을 첫 이벤트 ts 오름차순으로 추적.
+#   노드별 wait/exec/total 초를 계산해 표 + ASCII gantt 를 stdout 으로 출력.
+cmux_trace() {
+  if [ $# -lt 1 ] || [ -z "$1" ]; then
+    printf 'usage: cmux_trace <flowid|jobid>\n' >&2
+    return 2
+  fi
+  local key="$1"
+  [ -d "$CMUX_V5_JOB_DIR" ] || { printf '[cmux v5] trace: no job dir\n' >&2; return 1; }
+
+  # 1) 매칭 job 수집: basename 이 "<key>__"* 이거나, 정확히 <key>(단일 jobid) 인 것.
+  local tmpd
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-trace.XXXXXX")" || return 1
+  : > "$tmpd/rows"
+
+  local d base dir
+  local flow_min="" flow_max=""
+  local matched=0
+  for d in "$CMUX_V5_JOB_DIR"/*; do
+    [ -d "$d" ] || continue
+    base="${d##*/}"
+    case "$base" in
+      "${key}__"*) : ;;
+      "$key")      : ;;
+      *) continue ;;
+    esac
+    dir="$d"
+
+    # 노드 식별자: <flowid>__<nodeid> 면 nodeid, 단일 jobid 면 그대로.
+    local nodeid="$base"
+    case "$base" in
+      *__*) nodeid="${base##*__}" ;;
+    esac
+
+    # zsh: 루프 안에서 이미 local 인 이름을 bare 'local x'(=없이) 로 재선언하면
+    #   typeset 가 현재 값을 stdout 으로 '출력'한다($(...) 캡처 오염). 항상 초기값과 함께 선언.
+    local fevt="$dir/events.ndjson"
+    local t0="" t_disp="" t_end="" fstate="" target=""
+    t0="$(_cmux_v5_obs_first_ts "$fevt")"
+    _cmux_v5_obs_is_int "$t0" || t0="$(_cmux_v5_job_get "$base" created)"
+    t_disp="$(_cmux_v5_obs_ts_to "$fevt" DISPATCHING)"
+    t_end="$(_cmux_v5_obs_ts_to "$fevt" 'DONE|FAILED|CANCELLED')"
+    fstate="$(_cmux_v5_job_state "$base")"
+    [ -z "$fstate" ] && fstate="-"
+    # target 표시는 routed_to 우선, 없으면 target. resolve 호출 금지(표시 전용).
+    target="$(_cmux_v5_job_get "$base" routed_to)"
+    [ -z "$target" ] && target="$(_cmux_v5_job_get "$base" target)"
+    [ -z "$target" ] && target="-"
+
+    # 파생 지표(미싱 가드). disp 없으면 wait/exec 산출 불가 → '-'.
+    local wait_s="-" exec_s="-" total_s="-"
+    if _cmux_v5_obs_is_int "$t0" && _cmux_v5_obs_is_int "$t_disp"; then
+      wait_s=$(( t_disp - t0 ))
+      [ "$wait_s" -lt 0 ] && wait_s=0
+    fi
+    if _cmux_v5_obs_is_int "$t_disp" && _cmux_v5_obs_is_int "$t_end"; then
+      exec_s=$(( t_end - t_disp ))
+      [ "$exec_s" -lt 0 ] && exec_s=0
+    fi
+    if _cmux_v5_obs_is_int "$t0" && _cmux_v5_obs_is_int "$t_end"; then
+      total_s=$(( t_end - t0 ))
+      [ "$total_s" -lt 0 ] && total_s=0
+    fi
+
+    # flow wall-clock 경계 갱신(gantt 스케일용).
+    if _cmux_v5_obs_is_int "$t0"; then
+      { [ -z "$flow_min" ] || [ "$t0" -lt "$flow_min" ]; } && flow_min="$t0"
+    fi
+    if _cmux_v5_obs_is_int "$t_end"; then
+      { [ -z "$flow_max" ] || [ "$t_end" -gt "$flow_max" ]; } && flow_max="$t_end"
+    elif _cmux_v5_obs_is_int "$t0"; then
+      { [ -z "$flow_max" ] || [ "$t0" -gt "$flow_max" ]; } && flow_max="$t0"
+    fi
+
+    # 정렬 키 = t0(없으면 0). 한 줄 레코드(TAB 구분)로 적재.
+    local sort_t0="$t0"
+    _cmux_v5_obs_is_int "$sort_t0" || sort_t0=0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$sort_t0" "$nodeid" "$fstate" "$target" "$wait_s" "$exec_s" "$total_s" \
+      "${t0:-}" "${t_end:-}" >> "$tmpd/rows"
+    matched=$((matched + 1))
+  done
+
+  if [ "$matched" -eq 0 ]; then
+    printf '[cmux v5] trace: no jobs match "%s"\n' "$key" >&2
+    rm -rf "$tmpd"
+    return 1
+  fi
+
+  # 2) t0 오름차순 정렬.
+  sort -n "$tmpd/rows" > "$tmpd/rows.sorted"
+
+  # 3) 표 출력.
+  printf '%-16s %-10s %-14s %6s %6s %6s\n' \
+    "NODE" "STATE" "TARGET" "WAIT" "EXEC" "TOTAL"
+  local _t nid st tgt ws es ts0 te0 ttl
+  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 te0; do
+    [ -z "$nid" ] && continue
+    printf '%-16s %-10s %-14s %6s %6s %6s\n' \
+      "$nid" "$st" "$tgt" "$ws" "$es" "$ttl"
+  done < "$tmpd/rows.sorted"
+
+  # 4) ASCII gantt. flow_min..flow_max 를 고정 폭에 매핑.
+  local width=40
+  local span=1
+  if _cmux_v5_obs_is_int "$flow_min" && _cmux_v5_obs_is_int "$flow_max"; then
+    span=$(( flow_max - flow_min ))
+    [ "$span" -lt 1 ] && span=1
+  fi
+  printf '\n%-16s |%s|\n' "GANTT" "$(_cmux_v5_obs_bar "$width" '-')"
+  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 te0; do
+    [ -z "$nid" ] && continue
+    local off=0 wlen=0 elen=0
+    if _cmux_v5_obs_is_int "$ts0" && _cmux_v5_obs_is_int "$flow_min"; then
+      off=$(( (ts0 - flow_min) * width / span ))
+      [ "$off" -lt 0 ] && off=0
+    fi
+    # wait/ exec 길이를 폭에 스케일. 값이 '-' 면 0.
+    if _cmux_v5_obs_is_int "$ws" && [ "$ws" -gt 0 ]; then
+      wlen=$(( ws * width / span ))
+      [ "$wlen" -lt 1 ] && wlen=1
+    fi
+    if _cmux_v5_obs_is_int "$es" && [ "$es" -gt 0 ]; then
+      elen=$(( es * width / span ))
+      [ "$elen" -lt 1 ] && elen=1
+    fi
+    # exec 이 있는데 둘 다 0칸이면 최소 1칸 보장(같은 초에 끝난 경우 가독성).
+    if [ "$elen" -eq 0 ] && _cmux_v5_obs_is_int "$es" && [ "$es" -ge 0 ] \
+       && { [ "$st" = "DONE" ] || [ "$st" = "FAILED" ] || [ "$st" = "CANCELLED" ]; }; then
+      elen=1
+    fi
+    # 프레임(width) 밖으로 막대가 넘치지 않도록 off+wlen+elen 을 clamp.
+    #   span 폴백(미종료 job 으로 span=1 인 경우 등)에서 스케일이 폭을 초과할 수 있다.
+    [ "$off" -gt "$width" ] && off="$width"
+    if [ $(( off + wlen )) -gt "$width" ]; then
+      wlen=$(( width - off ))
+      [ "$wlen" -lt 0 ] && wlen=0
+    fi
+    if [ $(( off + wlen + elen )) -gt "$width" ]; then
+      elen=$(( width - off - wlen ))
+      [ "$elen" -lt 0 ] && elen=0
+    fi
+    local pad="" wbar="" ebar=""
+    pad="$(_cmux_v5_obs_bar "$off" ' ')"
+    wbar="$(_cmux_v5_obs_bar "$wlen" '.')"
+    ebar="$(_cmux_v5_obs_bar "$elen" '#')"
+    printf '%-16s |%s%s%s\n' "$nid" "$pad" "$wbar" "$ebar"
+  done < "$tmpd/rows.sorted"
+
+  rm -rf "$tmpd"
+  return 0
+}
+
+# cmux_metrics [selector]
+#   $CMUX_V5_JOB_DIR 전체 job 을 EFFECTIVE SURFACE(routed_to||target, _cmux_v5_resolve 로 정규화)
+#   별로 집계. selector 주어지면 effective surface == resolve(selector) 인 job 만 포함.
+#   surface 별: total / done / failed / cancelled / success_rate% / exec p50 / p95.
+cmux_metrics() {
+  local selector="${1:-}"
+  [ -d "$CMUX_V5_JOB_DIR" ] || { printf '[cmux v5] metrics: no job dir\n' >&2; return 0; }
+
+  local want=""
+  if [ -n "$selector" ]; then
+    want="$(_cmux_v5_resolve "$selector" 2>/dev/null)" || want="$selector"
+  fi
+
+  local tmpd
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-metrics.XXXXXX")" || return 1
+  : > "$tmpd/surfaces"   # 등장한 effective surface 목록(중복 허용 → 나중에 dedup)
+
+  # 1) job 순회 → surface 별 카운트 파일 + DONE exec 리스트 적재.
+  local base dir eff effsafe st
+  while IFS= read -r base; do
+    [ -z "$base" ] && continue
+    dir="$CMUX_V5_JOB_DIR/$base"
+    [ -d "$dir" ] || continue
+
+    # effective surface = routed_to 우선, 없으면 target.
+    eff="$(_cmux_v5_job_get "$base" routed_to)"
+    [ -z "$eff" ] && eff="$(_cmux_v5_job_get "$base" target)"
+    [ -z "$eff" ] && continue
+    # resolve 불가(예: routed_to 없는 raw @cap) job 은 스킵.
+    eff="$(_cmux_v5_resolve "$eff" 2>/dev/null)" || continue
+    [ -z "$eff" ] && continue
+    # selector 필터.
+    [ -n "$want" ] && [ "$eff" != "$want" ] && continue
+
+    # surface 키를 파일명 안전 문자열로(콜론/슬래시 치환).
+    effsafe="$(printf '%s' "$eff" | tr ':/ ' '___')"
+    printf '%s\t%s\n' "$effsafe" "$eff" >> "$tmpd/surfaces"
+
+    st="$(_cmux_v5_job_state "$base")"
+    case "$st" in
+      DONE)
+        printf 't\n' >> "$tmpd/$effsafe.done"
+        # exec_s = t_end - t_disp (t_disp 없으면 t_end - t0).
+        local fevt="$dir/events.ndjson" t0="" td="" te="" ex=""
+        t0="$(_cmux_v5_obs_first_ts "$fevt")"
+        _cmux_v5_obs_is_int "$t0" || t0="$(_cmux_v5_job_get "$base" created)"
+        td="$(_cmux_v5_obs_ts_to "$fevt" DISPATCHING)"
+        te="$(_cmux_v5_obs_ts_to "$fevt" 'DONE|FAILED|CANCELLED')"
+        ex=""
+        if _cmux_v5_obs_is_int "$te" && _cmux_v5_obs_is_int "$td"; then
+          ex=$(( te - td ))
+        elif _cmux_v5_obs_is_int "$te" && _cmux_v5_obs_is_int "$t0"; then
+          ex=$(( te - t0 ))
+        fi
+        if _cmux_v5_obs_is_int "$ex"; then
+          [ "$ex" -lt 0 ] && ex=0
+          printf '%s\n' "$ex" >> "$tmpd/$effsafe.exec"
+        fi
+        ;;
+      FAILED)    printf 't\n' >> "$tmpd/$effsafe.failed" ;;
+      CANCELLED) printf 't\n' >> "$tmpd/$effsafe.cancelled" ;;
+    esac
+    printf 't\n' >> "$tmpd/$effsafe.total"
+  done < <(_cmux_v5_job_list)
+
+  # 2) 표 헤더.
+  printf '%-14s %5s %5s %6s %9s %7s %5s %5s\n' \
+    "SURFACE" "TOTAL" "DONE" "FAILED" "CANCELLED" "SUCC%" "P50" "P95"
+
+  if [ ! -s "$tmpd/surfaces" ]; then
+    rm -rf "$tmpd"
+    return 0
+  fi
+
+  # 3) effective surface 별 집계(dedup → effsafe\teff 정렬 후 유니크).
+  local effsafe2 eff2
+  sort -u "$tmpd/surfaces" | while IFS="$(printf '\t')" read -r effsafe2 eff2; do
+    [ -z "$effsafe2" ] && continue
+    # 카운트 = 해당 .total/.done/.failed/.cancelled 파일의 라인 수(없으면 0).
+    #   파일 부재 시 wc 가 stderr 에러를 내므로 _obs_lines 로 존재 검사 후 셈.
+    local total="0" done="0" failed="0" cancelled="0"
+    total="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.total")"
+    done="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.done")"
+    failed="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.failed")"
+    cancelled="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.cancelled")"
+    _cmux_v5_obs_is_int "$total" || total=0
+    _cmux_v5_obs_is_int "$done" || done=0
+    _cmux_v5_obs_is_int "$failed" || failed=0
+    _cmux_v5_obs_is_int "$cancelled" || cancelled=0
+
+    # success_rate = done*100/(done+failed). 분모 0 → '-'.
+    local denom="0" succ="-"
+    denom=$(( done + failed ))
+    if [ "$denom" -gt 0 ]; then
+      succ=$(( done * 100 / denom ))
+    else
+      succ="-"
+    fi
+
+    # percentile over DONE exec 리스트. n==0 → '-'.
+    local p50="-" p95="-" n="0" i50="0" i95="0"
+    if [ -f "$tmpd/$effsafe2.exec" ]; then
+      sort -n "$tmpd/$effsafe2.exec" > "$tmpd/$effsafe2.exec.sorted"
+      n="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.exec.sorted")"
+      _cmux_v5_obs_is_int "$n" || n=0
+      if [ "$n" -gt 0 ]; then
+        # ceil(p/100*n)-1, clamp [0,n-1]. 정수 ceil = (p*n+99)/100 - 1.
+        i50=$(( (50 * n + 99) / 100 - 1 ))
+        i95=$(( (95 * n + 99) / 100 - 1 ))
+        [ "$i50" -lt 0 ] && i50=0
+        [ "$i95" -lt 0 ] && i95=0
+        [ "$i50" -ge "$n" ] && i50=$(( n - 1 ))
+        [ "$i95" -ge "$n" ] && i95=$(( n - 1 ))
+        p50="$(sed -n "$(( i50 + 1 ))p" "$tmpd/$effsafe2.exec.sorted")"
+        p95="$(sed -n "$(( i95 + 1 ))p" "$tmpd/$effsafe2.exec.sorted")"
+        [ -z "$p50" ] && p50="-"
+        [ -z "$p95" ] && p95="-"
+      fi
+    fi
+
+    printf '%-14s %5s %5s %6s %9s %7s %5s %5s\n' \
+      "$eff2" "$total" "$done" "$failed" "$cancelled" "$succ" "$p50" "$p95"
+  done
+
+  rm -rf "$tmpd"
+  return 0
 }
