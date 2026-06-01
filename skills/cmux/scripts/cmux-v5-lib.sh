@@ -33,6 +33,9 @@
 : "${CMUX_V5_PROMPT_STYLE:=compact}" # compact|verbose — LLM 수신 규칙 길이
 : "${CMUX_V5_EARLY_IDLE:=off}"      # off|worker|llm|on — 실패 조기 감지용 polling
 : "${CMUX_V5_POLL_INTERVAL:=1}"     # early-idle polling 간격
+: "${CMUX_V5_LOCK_DIR:=/tmp/cmux-locks}"   # advisory lock 디렉터리
+: "${CMUX_V5_LOCK_TTL:=300}"               # stale lock 판정 초(소유 PID 사망 OR age>TTL)
+: "${CMUX_V5_LOCK_WAIT:=10}"               # acquire 재시도 최대 대기 초
 
 # ---- private ----
 
@@ -109,12 +112,98 @@ _cmux_v5_garbage_collect() {
   [ "$_CMUX_V5_GC_DONE" = "1" ] && return 0
   _CMUX_V5_GC_DONE=1
   find "$CMUX_V5_FIFO_DIR" -type p -mmin +720 -delete 2>/dev/null &
+  # stale lock 디렉터리 백스톱 정리: ts-file 내용 기반 stale 은 acquire 시 break 하므로
+  # 여기선 디렉터리 mtime 이 TTL 보다 오래된 *.lock 만 coarse 하게 제거.
+  [ -d "$CMUX_V5_LOCK_DIR" ] && find "$CMUX_V5_LOCK_DIR" -type d -name '*.lock' -mmin +$(( ${CMUX_V5_LOCK_TTL:-300} / 60 + 1 )) -exec rm -rf {} + 2>/dev/null &
 }
 
 _cmux_v5_init_dir() {
   [ -d "$CMUX_V5_FIFO_DIR" ] && { _cmux_v5_garbage_collect; return 0; }
   mkdir -p "$CMUX_V5_FIFO_DIR" && chmod 700 "$CMUX_V5_FIFO_DIR"
   _cmux_v5_garbage_collect
+}
+
+# ---- 이식형 advisory lock (mkdir 기반 mutex, stat 의존 X) ----
+
+# _cmux_v5_lock_path <name> -> 락 디렉터리 경로
+_cmux_v5_lock_path() { printf '%s/%s.lock' "$CMUX_V5_LOCK_DIR" "$1"; }
+
+# _cmux_v5_lock_is_stale <lockpath> -> stale 이면 0, 아니면 1.
+#   판정: 소유 PID 명시적 사망 OR (now - ts > TTL).
+#   ts 파일을 직접 읽어 비교하므로 stat 의 BSD/GNU 차이를 회피.
+#   주의: 락 획득은 mkdir → pid 기록 → ts 기록 순서(아래 _cmux_v5_lock)라,
+#   "막 태어나는 중"인 락은 pid 가 (대개) 살아있고 ts 만 잠깐 비어 있다.
+#   따라서 dead-pid 를 먼저 보고, 그 다음 빈/비정상 ts 는 stale 가 아니라
+#   '점유 중'으로 간주해야 born-window 경합(빈 ts 를 stale 로 오판→타 프로세스가
+#   살아있는 락을 rm 후 이중 획득)을 차단한다. pid 기록 전 크래시처럼
+#   pid·ts 모두 없는 진짜 좀비는 GC 의 mtime 백스톱이 정리한다.
+_cmux_v5_lock_is_stale() {
+  local lockpath="$1" pid ts now ttl
+  ttl="${CMUX_V5_LOCK_TTL:-300}"
+  pid="$(cat "$lockpath/pid" 2>/dev/null)"
+  # 소유 PID 가 기록돼 있고 그게 죽었으면 ts 유무와 무관하게 stale
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  ts="$(cat "$lockpath/ts" 2>/dev/null)"
+  # ts 가 비었거나 숫자가 아니면 = 막 태어나는 중(혹은 GC 가 처리) → 점유로 간주
+  case "$ts" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  now="$(date +%s)"
+  if [ $((now - ts)) -gt "$ttl" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# _cmux_v5_lock <name> [wait_secs]
+#   atomic mkdir 으로 락 획득. 점유 중이면 stale 검사→break 후 1회 재시도,
+#   아니면 0.2s 간격으로 wait_secs 까지 폴링. 성공 0, 타임아웃 1.
+#   획득 시 pid/ts 메타를 락 디렉터리 안에 기록.
+_cmux_v5_lock() {
+  local name="$1" wait_secs="${2:-${CMUX_V5_LOCK_WAIT:-10}}"
+  local lockpath now deadline
+  # 빈/슬래시 포함 name 은 락 디렉터리 밖 경로를 유발하므로 거부
+  case "$name" in ''|*/*) return 1 ;; esac
+  lockpath="$(_cmux_v5_lock_path "$name")"
+  # 락 루트 디렉터리 lazy init
+  mkdir -p "$CMUX_V5_LOCK_DIR" 2>/dev/null && chmod 700 "$CMUX_V5_LOCK_DIR" 2>/dev/null
+  deadline=$(( $(date +%s) + wait_secs ))
+  while :; do
+    # 핵심 mutex: 기존 디렉터리면 mkdir 가 원자적으로 실패.
+    if mkdir "$lockpath" 2>/dev/null; then
+      printf '%s' "$$" > "$lockpath/pid" 2>/dev/null
+      date +%s > "$lockpath/ts" 2>/dev/null
+      return 0
+    fi
+    # 점유 중 — stale 이면 break 후 1회 재시도.
+    if _cmux_v5_lock_is_stale "$lockpath"; then
+      rm -rf "$lockpath" 2>/dev/null
+      if mkdir "$lockpath" 2>/dev/null; then
+        printf '%s' "$$" > "$lockpath/pid" 2>/dev/null
+        date +%s > "$lockpath/ts" 2>/dev/null
+        return 0
+      fi
+    fi
+    # 마감 시각 초과면 타임아웃.
+    now="$(date +%s)"
+    [ "$now" -ge "$deadline" ] && return 1
+    sleep 0.2
+  done
+}
+
+# _cmux_v5_unlock <name>
+#   소유 PID($$) 일치할 때만 제거(타 프로세스 락 오삭제 방지). 항상 0 반환.
+_cmux_v5_unlock() {
+  local name="$1" lockpath pid
+  case "$name" in ''|*/*) return 0 ;; esac
+  lockpath="$(_cmux_v5_lock_path "$name")"
+  pid="$(cat "$lockpath/pid" 2>/dev/null)"
+  if [ "$pid" = "$$" ]; then
+    rm -rf "$lockpath" 2>/dev/null
+  fi
+  return 0
 }
 
 _cmux_v5_make_fifo() {
