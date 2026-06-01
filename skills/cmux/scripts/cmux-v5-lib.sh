@@ -1603,6 +1603,133 @@ EOF
   return "$worst"
 }
 
+# ---- P3 라우팅/로드밸런싱 ----
+# 호출자가 고정 surface 대신 CAPABILITY(@coding/@codex/@llm 등)를 타깃으로 지정하면
+# P1 job 레지스트리를 근거로 "같은 capability 중 가장 덜 바쁜 surface"를 골라준다.
+# 기존 public 함수와 완전 독립인 additive 레이어 — cmux_flow 의 @cap 해석 훅 하나만 연결한다.
+#
+# capability 모델:
+#   - surface 의 cap 태그는 title(우선) 기반. title 에 codex/claude/gemini/agy 포함 시 해당 태그,
+#     아니면 _cmux_v5_detect 결과(llm|worker)로 폴백. 매핑은 _cmux_v5_surface_cap 한 곳에 모은다.
+#   - selector @X 가 surface 에 매칭되는 규칙(가독성 우선, 한 곳):
+#       @llm    → _cmux_v5_detect == llm 인 모든 surface
+#       @worker → _cmux_v5_detect == worker 인 모든 surface
+#       @codex/@claude/@gemini/@agy(그 외) → cap 태그가 X 와 정확히 일치
+#   - self 라우팅 금지: agent 가 자기 자신(CMUX_SURFACE_ID)에게 일을 돌리는 것을 막기 위해
+#     후보에서 self 는 제외한다(cmux_other_surfaces 만 열거하므로 자연히 빠짐).
+
+# _cmux_v5_surface_cap <surface> -> capability 태그 1개 출력.
+#   title 을 소문자화하여 알려진 키워드를 태그로 매핑. 미스 시 detect(llm|worker)로 폴백.
+#   매핑 테이블은 이 case 한 곳에서만 관리(확장 용이).
+_cmux_v5_surface_cap() {
+  local surface="$1" title lower
+  [ -z "$surface" ] && return 1
+  title="$(_cmux_v5_surface_title "$surface")"
+  # 소문자화(BSD-safe: tr). title 이 비면 lower 도 빈 문자열.
+  lower="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    *codex*)  printf 'codex';  return 0 ;;
+    *claude*) printf 'claude'; return 0 ;;
+    *gemini*) printf 'gemini'; return 0 ;;
+    *agy*)    printf 'agy';    return 0 ;;
+  esac
+  # 알려진 title 키워드 없음 → 일반 클래스(llm|worker)로 폴백.
+  _cmux_v5_detect "$surface"
+}
+
+# _cmux_v5_cap_match <selector-without-@> <surface> -> 매칭이면 rc0, 아니면 rc1.
+#   가독성 우선 규칙: llm/worker 는 detect 클래스로, 그 외는 정확한 cap 태그로 비교.
+_cmux_v5_cap_match() {
+  local sel="$1" surface="$2"
+  case "$sel" in
+    llm|worker) [ "$(_cmux_v5_detect "$surface")" = "$sel" ] ;;
+    *)          [ "$(_cmux_v5_surface_cap "$surface")" = "$sel" ] ;;
+  esac
+}
+
+# _cmux_v5_busy_count <surface> -> 이 surface 를 target 으로 하는 in-flight(DISPATCHING|RUNNING)
+#   P1 job 수를 정수로 출력. 양쪽 target 을 _cmux_v5_resolve 로 정규화하여
+#   surface:6 과 그 surface 를 가리키는 title 이 같은 것으로 매칭되게 한다.
+#   항상 정수 출력(없으면 0) — 호출부의 산술 비교가 빈 값으로 깨지지 않도록.
+_cmux_v5_busy_count() {
+  local surface="$1" want count=0 job jt
+  [ -z "$surface" ] && { printf '0'; return 0; }
+  want="$(_cmux_v5_resolve "$surface" 2>/dev/null)" || want="$surface"
+  # DISPATCHING + RUNNING 두 상태를 한 스트림으로 합쳐 순회.
+  # bash 서브셸 변수 소실 회피: 파이프 대신 process substitution 으로 현재 셸에서 루프.
+  while IFS= read -r job; do
+    [ -z "$job" ] && continue
+    # P3 라우팅된 job 은 target 에 raw @cap 이 감사용으로 남아있고 실제 surface 는
+    # routed_to 에 있다. routed_to 우선, 없으면(=pre-P3/구체 target) target 폴백.
+    jt="$(_cmux_v5_job_get "$job" routed_to)"
+    [ -z "$jt" ] && jt="$(_cmux_v5_job_get "$job" target)"
+    [ -z "$jt" ] && continue
+    jt="$(_cmux_v5_resolve "$jt" 2>/dev/null)" || continue
+    [ "$jt" = "$want" ] && count=$((count + 1))
+  done < <( { _cmux_v5_job_list DISPATCHING; _cmux_v5_job_list RUNNING; } )
+  printf '%s' "$count"
+}
+
+# _cmux_v5_route <selector> [exclude_surface] -> 구체 surface:N 출력.
+#   - selector 가 @ 로 시작하지 않으면 passthrough: _cmux_v5_resolve 후 출력.
+#     단 exclude_surface 와 같게 resolve 되면 rc1(호출자가 다른 것을 원함).
+#   - @cap selector: 후보 = cmux_other_surfaces(self 제외). capability 규칙 매칭 +
+#     exclude_surface(resolved) 가 아닌 것만 필터. 그 중 busy_count 최소를 선택
+#     (동률 → 열거 순서상 첫 번째, stable). 없으면 rc1 + stderr 안내.
+_cmux_v5_route() {
+  local selector="$1" exclude="${2:-}"
+  local exclude_r=""
+  if [ -n "$exclude" ]; then
+    exclude_r="$(_cmux_v5_resolve "$exclude" 2>/dev/null)" || exclude_r="$exclude"
+  fi
+
+  # @ 로 시작하지 않으면 leading @ 분기 전에 resolve 하면 안 되므로 case 로 먼저 판정.
+  case "$selector" in
+    @*) : ;;
+    *)
+      local concrete
+      concrete="$(_cmux_v5_resolve "$selector")" || return 6
+      if [ -n "$exclude_r" ] && [ "$concrete" = "$exclude_r" ]; then
+        return 1
+      fi
+      printf '%s' "$concrete"
+      return 0
+      ;;
+  esac
+
+  # 여기부터 @cap 경로. 선행 '@' 제거한 selector 본문.
+  local sel="${selector#@}"
+  local best="" best_n="" cand cand_r bn
+  while IFS= read -r cand; do
+    [ -z "$cand" ] && continue
+    cand_r="$(_cmux_v5_resolve "$cand" 2>/dev/null)" || continue
+    # exclude 와 동일하면 스킵.
+    [ -n "$exclude_r" ] && [ "$cand_r" = "$exclude_r" ] && continue
+    # capability 규칙 매칭 아니면 스킵.
+    _cmux_v5_cap_match "$sel" "$cand_r" || continue
+    bn="$(_cmux_v5_busy_count "$cand_r")"
+    case "$bn" in ''|*[!0-9]*) bn=0 ;; esac
+    # strict < : 동률이면 교체하지 않아 열거 순서상 첫 번째가 stable 하게 유지.
+    if [ -z "$best" ] || [ "$bn" -lt "$best_n" ]; then
+      best="$cand_r"
+      best_n="$bn"
+    fi
+  done < <(cmux_other_surfaces)
+
+  if [ -z "$best" ]; then
+    printf '[cmux v5] route: no surface matches %s\n' "$selector" >&2
+    return 1
+  fi
+  printf '%s' "$best"
+  return 0
+}
+
+# _cmux_v5_route_retry <selector> <failed_surface> -> 같은 capability 의 *다른* surface 선택.
+#   thin wrapper: failed_surface 를 exclude 로 넘긴다. 구체 ref(@ 없음)면 대안이 없어 rc1.
+_cmux_v5_route_retry() {
+  _cmux_v5_route "$1" "$2"
+}
+
 # ---- cmux_flow (P2 DAG 스케줄러) ----
 # P1 job 레지스트리 위에 얹는 의존성 그래프 스케줄러. 기존 public 함수와 완전 독립인 additive 레이어.
 # stdin (또는 파일 인자) 의 TAB 구분 DSL 을 소비:
@@ -1642,6 +1769,24 @@ _cmux_v5_flow_exec_node() {
   local flowid="$1" nodeid="$2" target="$3" prompt="$4"
   local jobid out rc
   jobid="${flowid}__${nodeid}"
+  # P3 훅: target 이 @cap 이면 dispatch 전에 구체 surface:N 으로 라우팅.
+  #   라우팅 실패 → dispatch 없이 FAILED. 성공 → routed_to 메타 기록 후 target 치환.
+  #   (DISPATCHING 진입 전에 처리해 node 가 자기 busy_count 에 잡히지 않게 한다.
+  #    원래 @cap target 메타는 감사용으로 보존하고 routed_to 에 결과를 적는다.)
+  case "$target" in
+    @*)
+      local routed
+      routed="$(_cmux_v5_route "$target")"
+      rc=$?
+      if [ "$rc" -ne 0 ] || [ -z "$routed" ]; then
+        _cmux_v5_job_set_state "$jobid" FAILED
+        printf '[cmux v5] flow node %s: cannot route %s\n' "$nodeid" "$target" >&2
+        return 0
+      fi
+      _cmux_v5_job_set_meta "$jobid" routed_to "$routed"
+      target="$routed"
+      ;;
+  esac
   _cmux_v5_job_set_state "$jobid" DISPATCHING
   _cmux_v5_job_set_state "$jobid" RUNNING
   # rc/stdout 위생: local 대입 분리 (zsh 무대입 재선언 stdout 오염 회피는 상단 1회 선언으로 처리).
