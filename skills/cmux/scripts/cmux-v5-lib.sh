@@ -2068,3 +2068,336 @@ cmux_flow() {
   rm -rf "$tmpd"
   return "$rc_all"
 }
+
+# ---- P4 관측가능성 ----
+# P1 job 레지스트리(events.ndjson + meta) 위에 얹는 읽기 전용 관측 레이어.
+# 기존 P0~P3 / public 함수와 완전 독립인 additive 레이어 — 어떤 기존 함수도 수정하지 않는다.
+# jq 미사용: events.ndjson 의 필드 포맷이 통제되어 있으므로 grep -oE + 파라미터 확장으로 파싱한다.
+#   ts        : grep -oE '"ts":[0-9]+' | grep -oE '[0-9]+'
+#   to-state  : 특정 to-state 로 라인을 grep 해서 잡으므로 from/to 충돌이 없다.
+# BSD-safe: sort -n / grep -oE / printf / 정수 $(( )) 만 사용. bc·%N·GNU 전용 플래그 없음.
+
+# _cmux_v5_obs_first_ts <events-file> -> 첫 이벤트의 ts(없으면 빈). 생성/PENDING 시각.
+_cmux_v5_obs_first_ts() {
+  local f="$1" line
+  [ -f "$f" ] || return 0
+  line="$(head -1 "$f" 2>/dev/null)"
+  [ -z "$line" ] && return 0
+  printf '%s' "$line" | grep -oE '"ts":[0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+# _cmux_v5_obs_ts_to <events-file> <to-state-regex> -> 그 to-state 로의 첫 전이 ts(없으면 빈).
+#   라인을 "to":"X" 로 grep 한 뒤 ts 만 추출 → from 필드값에 절대 오염되지 않는다.
+_cmux_v5_obs_ts_to() {
+  local f="$1" pat="$2" line
+  [ -f "$f" ] || return 0
+  line="$(grep -E "\"to\":\"(${pat})\"" "$f" 2>/dev/null | head -1)"
+  [ -z "$line" ] && return 0
+  printf '%s' "$line" | grep -oE '"ts":[0-9]+' | grep -oE '[0-9]+' | head -1
+}
+
+# 정수 가드: 인자가 비었거나 숫자가 아니면 rc1(=값 없음). 산술 전 항상 통과시켜
+# 여전히 RUNNING 인 job(t_end 없음)에서 $(( )) 가 깨지지 않게 한다.
+_cmux_v5_obs_is_int() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+# _cmux_v5_obs_lines <file> -> 파일의 라인 수(부재/빈 파일이면 0). wc 의 stderr 에러 회피.
+_cmux_v5_obs_lines() {
+  local f="$1" n
+  [ -f "$f" ] || { printf '0'; return 0; }
+  n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+  _cmux_v5_obs_is_int "$n" || n=0
+  printf '%s' "$n"
+}
+
+# _cmux_v5_obs_bar <length> <fill-char> -> length 칸의 fill 문자 막대(0이면 빈 문자열).
+#   printf '%*s' 로 공백을 찍고 tr 로 치환(BSD-safe). length 가 음수/비정수면 빈 문자열.
+_cmux_v5_obs_bar() {
+  local n="$1" ch="$2"
+  _cmux_v5_obs_is_int "$n" || { printf ''; return 0; }
+  [ "$n" -le 0 ] && { printf ''; return 0; }
+  printf '%*s' "$n" '' | tr ' ' "$ch"
+}
+
+# cmux_trace <flowid|jobid>
+#   <flowid>__ 로 시작하는 모든 job(또는 단일 jobid)을 첫 이벤트 ts 오름차순으로 추적.
+#   노드별 wait/exec/total 초를 계산해 표 + ASCII gantt 를 stdout 으로 출력.
+cmux_trace() {
+  if [ $# -lt 1 ] || [ -z "$1" ]; then
+    printf 'usage: cmux_trace <flowid|jobid>\n' >&2
+    return 2
+  fi
+  local key="$1"
+  [ -d "$CMUX_V5_JOB_DIR" ] || { printf '[cmux v5] trace: no job dir\n' >&2; return 1; }
+
+  # 1) 매칭 job 수집: basename 이 "<key>__"* 이거나, 정확히 <key>(단일 jobid) 인 것.
+  local tmpd
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-trace.XXXXXX")" || return 1
+  : > "$tmpd/rows"
+
+  local d base dir
+  local flow_min="" flow_max=""
+  local matched=0
+  for d in "$CMUX_V5_JOB_DIR"/*; do
+    [ -d "$d" ] || continue
+    base="${d##*/}"
+    case "$base" in
+      "${key}__"*) : ;;
+      "$key")      : ;;
+      *) continue ;;
+    esac
+    dir="$d"
+
+    # 노드 식별자: <flowid>__<nodeid> 면 nodeid, 단일 jobid 면 그대로.
+    local nodeid="$base"
+    case "$base" in
+      *__*) nodeid="${base##*__}" ;;
+    esac
+
+    # zsh: 루프 안에서 이미 local 인 이름을 bare 'local x'(=없이) 로 재선언하면
+    #   typeset 가 현재 값을 stdout 으로 '출력'한다($(...) 캡처 오염). 항상 초기값과 함께 선언.
+    local fevt="$dir/events.ndjson"
+    local t0="" t_disp="" t_end="" fstate="" target=""
+    t0="$(_cmux_v5_obs_first_ts "$fevt")"
+    _cmux_v5_obs_is_int "$t0" || t0="$(_cmux_v5_job_get "$base" created)"
+    t_disp="$(_cmux_v5_obs_ts_to "$fevt" DISPATCHING)"
+    t_end="$(_cmux_v5_obs_ts_to "$fevt" 'DONE|FAILED|CANCELLED')"
+    fstate="$(_cmux_v5_job_state "$base")"
+    [ -z "$fstate" ] && fstate="-"
+    # target 표시는 routed_to 우선, 없으면 target. resolve 호출 금지(표시 전용).
+    target="$(_cmux_v5_job_get "$base" routed_to)"
+    [ -z "$target" ] && target="$(_cmux_v5_job_get "$base" target)"
+    [ -z "$target" ] && target="-"
+
+    # 파생 지표(미싱 가드). disp 없으면 wait/exec 산출 불가 → '-'.
+    local wait_s="-" exec_s="-" total_s="-"
+    if _cmux_v5_obs_is_int "$t0" && _cmux_v5_obs_is_int "$t_disp"; then
+      wait_s=$(( t_disp - t0 ))
+      [ "$wait_s" -lt 0 ] && wait_s=0
+    fi
+    if _cmux_v5_obs_is_int "$t_disp" && _cmux_v5_obs_is_int "$t_end"; then
+      exec_s=$(( t_end - t_disp ))
+      [ "$exec_s" -lt 0 ] && exec_s=0
+    fi
+    if _cmux_v5_obs_is_int "$t0" && _cmux_v5_obs_is_int "$t_end"; then
+      total_s=$(( t_end - t0 ))
+      [ "$total_s" -lt 0 ] && total_s=0
+    fi
+
+    # flow wall-clock 경계 갱신(gantt 스케일용).
+    if _cmux_v5_obs_is_int "$t0"; then
+      { [ -z "$flow_min" ] || [ "$t0" -lt "$flow_min" ]; } && flow_min="$t0"
+    fi
+    if _cmux_v5_obs_is_int "$t_end"; then
+      { [ -z "$flow_max" ] || [ "$t_end" -gt "$flow_max" ]; } && flow_max="$t_end"
+    elif _cmux_v5_obs_is_int "$t0"; then
+      { [ -z "$flow_max" ] || [ "$t0" -gt "$flow_max" ]; } && flow_max="$t0"
+    fi
+
+    # 정렬 키 = t0(없으면 0). 한 줄 레코드(TAB 구분)로 적재.
+    local sort_t0="$t0"
+    _cmux_v5_obs_is_int "$sort_t0" || sort_t0=0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$sort_t0" "$nodeid" "$fstate" "$target" "$wait_s" "$exec_s" "$total_s" \
+      "${t0:-}" "${t_end:-}" >> "$tmpd/rows"
+    matched=$((matched + 1))
+  done
+
+  if [ "$matched" -eq 0 ]; then
+    printf '[cmux v5] trace: no jobs match "%s"\n' "$key" >&2
+    rm -rf "$tmpd"
+    return 1
+  fi
+
+  # 2) t0 오름차순 정렬.
+  sort -n "$tmpd/rows" > "$tmpd/rows.sorted"
+
+  # 3) 표 출력.
+  printf '%-16s %-10s %-14s %6s %6s %6s\n' \
+    "NODE" "STATE" "TARGET" "WAIT" "EXEC" "TOTAL"
+  local _t nid st tgt ws es ts0 te0 ttl
+  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 te0; do
+    [ -z "$nid" ] && continue
+    printf '%-16s %-10s %-14s %6s %6s %6s\n' \
+      "$nid" "$st" "$tgt" "$ws" "$es" "$ttl"
+  done < "$tmpd/rows.sorted"
+
+  # 4) ASCII gantt. flow_min..flow_max 를 고정 폭에 매핑.
+  local width=40
+  local span=1
+  if _cmux_v5_obs_is_int "$flow_min" && _cmux_v5_obs_is_int "$flow_max"; then
+    span=$(( flow_max - flow_min ))
+    [ "$span" -lt 1 ] && span=1
+  fi
+  printf '\n%-16s |%s|\n' "GANTT" "$(_cmux_v5_obs_bar "$width" '-')"
+  while IFS="$(printf '\t')" read -r _t nid st tgt ws es ttl ts0 te0; do
+    [ -z "$nid" ] && continue
+    local off=0 wlen=0 elen=0
+    if _cmux_v5_obs_is_int "$ts0" && _cmux_v5_obs_is_int "$flow_min"; then
+      off=$(( (ts0 - flow_min) * width / span ))
+      [ "$off" -lt 0 ] && off=0
+    fi
+    # wait/ exec 길이를 폭에 스케일. 값이 '-' 면 0.
+    if _cmux_v5_obs_is_int "$ws" && [ "$ws" -gt 0 ]; then
+      wlen=$(( ws * width / span ))
+      [ "$wlen" -lt 1 ] && wlen=1
+    fi
+    if _cmux_v5_obs_is_int "$es" && [ "$es" -gt 0 ]; then
+      elen=$(( es * width / span ))
+      [ "$elen" -lt 1 ] && elen=1
+    fi
+    # exec 이 있는데 둘 다 0칸이면 최소 1칸 보장(같은 초에 끝난 경우 가독성).
+    if [ "$elen" -eq 0 ] && _cmux_v5_obs_is_int "$es" && [ "$es" -ge 0 ] \
+       && { [ "$st" = "DONE" ] || [ "$st" = "FAILED" ] || [ "$st" = "CANCELLED" ]; }; then
+      elen=1
+    fi
+    # 프레임(width) 밖으로 막대가 넘치지 않도록 off+wlen+elen 을 clamp.
+    #   span 폴백(미종료 job 으로 span=1 인 경우 등)에서 스케일이 폭을 초과할 수 있다.
+    [ "$off" -gt "$width" ] && off="$width"
+    if [ $(( off + wlen )) -gt "$width" ]; then
+      wlen=$(( width - off ))
+      [ "$wlen" -lt 0 ] && wlen=0
+    fi
+    if [ $(( off + wlen + elen )) -gt "$width" ]; then
+      elen=$(( width - off - wlen ))
+      [ "$elen" -lt 0 ] && elen=0
+    fi
+    local pad="" wbar="" ebar=""
+    pad="$(_cmux_v5_obs_bar "$off" ' ')"
+    wbar="$(_cmux_v5_obs_bar "$wlen" '.')"
+    ebar="$(_cmux_v5_obs_bar "$elen" '#')"
+    printf '%-16s |%s%s%s\n' "$nid" "$pad" "$wbar" "$ebar"
+  done < "$tmpd/rows.sorted"
+
+  rm -rf "$tmpd"
+  return 0
+}
+
+# cmux_metrics [selector]
+#   $CMUX_V5_JOB_DIR 전체 job 을 EFFECTIVE SURFACE(routed_to||target, _cmux_v5_resolve 로 정규화)
+#   별로 집계. selector 주어지면 effective surface == resolve(selector) 인 job 만 포함.
+#   surface 별: total / done / failed / cancelled / success_rate% / exec p50 / p95.
+cmux_metrics() {
+  local selector="${1:-}"
+  [ -d "$CMUX_V5_JOB_DIR" ] || { printf '[cmux v5] metrics: no job dir\n' >&2; return 0; }
+
+  local want=""
+  if [ -n "$selector" ]; then
+    want="$(_cmux_v5_resolve "$selector" 2>/dev/null)" || want="$selector"
+  fi
+
+  local tmpd
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-metrics.XXXXXX")" || return 1
+  : > "$tmpd/surfaces"   # 등장한 effective surface 목록(중복 허용 → 나중에 dedup)
+
+  # 1) job 순회 → surface 별 카운트 파일 + DONE exec 리스트 적재.
+  local base dir eff effsafe st
+  while IFS= read -r base; do
+    [ -z "$base" ] && continue
+    dir="$CMUX_V5_JOB_DIR/$base"
+    [ -d "$dir" ] || continue
+
+    # effective surface = routed_to 우선, 없으면 target.
+    eff="$(_cmux_v5_job_get "$base" routed_to)"
+    [ -z "$eff" ] && eff="$(_cmux_v5_job_get "$base" target)"
+    [ -z "$eff" ] && continue
+    # resolve 불가(예: routed_to 없는 raw @cap) job 은 스킵.
+    eff="$(_cmux_v5_resolve "$eff" 2>/dev/null)" || continue
+    [ -z "$eff" ] && continue
+    # selector 필터.
+    [ -n "$want" ] && [ "$eff" != "$want" ] && continue
+
+    # surface 키를 파일명 안전 문자열로(콜론/슬래시 치환).
+    effsafe="$(printf '%s' "$eff" | tr ':/ ' '___')"
+    printf '%s\t%s\n' "$effsafe" "$eff" >> "$tmpd/surfaces"
+
+    st="$(_cmux_v5_job_state "$base")"
+    case "$st" in
+      DONE)
+        printf 't\n' >> "$tmpd/$effsafe.done"
+        # exec_s = t_end - t_disp (t_disp 없으면 t_end - t0).
+        local fevt="$dir/events.ndjson" t0="" td="" te="" ex=""
+        t0="$(_cmux_v5_obs_first_ts "$fevt")"
+        _cmux_v5_obs_is_int "$t0" || t0="$(_cmux_v5_job_get "$base" created)"
+        td="$(_cmux_v5_obs_ts_to "$fevt" DISPATCHING)"
+        te="$(_cmux_v5_obs_ts_to "$fevt" 'DONE|FAILED|CANCELLED')"
+        ex=""
+        if _cmux_v5_obs_is_int "$te" && _cmux_v5_obs_is_int "$td"; then
+          ex=$(( te - td ))
+        elif _cmux_v5_obs_is_int "$te" && _cmux_v5_obs_is_int "$t0"; then
+          ex=$(( te - t0 ))
+        fi
+        if _cmux_v5_obs_is_int "$ex"; then
+          [ "$ex" -lt 0 ] && ex=0
+          printf '%s\n' "$ex" >> "$tmpd/$effsafe.exec"
+        fi
+        ;;
+      FAILED)    printf 't\n' >> "$tmpd/$effsafe.failed" ;;
+      CANCELLED) printf 't\n' >> "$tmpd/$effsafe.cancelled" ;;
+    esac
+    printf 't\n' >> "$tmpd/$effsafe.total"
+  done < <(_cmux_v5_job_list)
+
+  # 2) 표 헤더.
+  printf '%-14s %5s %5s %6s %9s %7s %5s %5s\n' \
+    "SURFACE" "TOTAL" "DONE" "FAILED" "CANCELLED" "SUCC%" "P50" "P95"
+
+  if [ ! -s "$tmpd/surfaces" ]; then
+    rm -rf "$tmpd"
+    return 0
+  fi
+
+  # 3) effective surface 별 집계(dedup → effsafe\teff 정렬 후 유니크).
+  local effsafe2 eff2
+  sort -u "$tmpd/surfaces" | while IFS="$(printf '\t')" read -r effsafe2 eff2; do
+    [ -z "$effsafe2" ] && continue
+    # 카운트 = 해당 .total/.done/.failed/.cancelled 파일의 라인 수(없으면 0).
+    #   파일 부재 시 wc 가 stderr 에러를 내므로 _obs_lines 로 존재 검사 후 셈.
+    local total="0" done="0" failed="0" cancelled="0"
+    total="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.total")"
+    done="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.done")"
+    failed="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.failed")"
+    cancelled="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.cancelled")"
+    _cmux_v5_obs_is_int "$total" || total=0
+    _cmux_v5_obs_is_int "$done" || done=0
+    _cmux_v5_obs_is_int "$failed" || failed=0
+    _cmux_v5_obs_is_int "$cancelled" || cancelled=0
+
+    # success_rate = done*100/(done+failed). 분모 0 → '-'.
+    local denom="0" succ="-"
+    denom=$(( done + failed ))
+    if [ "$denom" -gt 0 ]; then
+      succ=$(( done * 100 / denom ))
+    else
+      succ="-"
+    fi
+
+    # percentile over DONE exec 리스트. n==0 → '-'.
+    local p50="-" p95="-" n="0" i50="0" i95="0"
+    if [ -f "$tmpd/$effsafe2.exec" ]; then
+      sort -n "$tmpd/$effsafe2.exec" > "$tmpd/$effsafe2.exec.sorted"
+      n="$(_cmux_v5_obs_lines "$tmpd/$effsafe2.exec.sorted")"
+      _cmux_v5_obs_is_int "$n" || n=0
+      if [ "$n" -gt 0 ]; then
+        # ceil(p/100*n)-1, clamp [0,n-1]. 정수 ceil = (p*n+99)/100 - 1.
+        i50=$(( (50 * n + 99) / 100 - 1 ))
+        i95=$(( (95 * n + 99) / 100 - 1 ))
+        [ "$i50" -lt 0 ] && i50=0
+        [ "$i95" -lt 0 ] && i95=0
+        [ "$i50" -ge "$n" ] && i50=$(( n - 1 ))
+        [ "$i95" -ge "$n" ] && i95=$(( n - 1 ))
+        p50="$(sed -n "$(( i50 + 1 ))p" "$tmpd/$effsafe2.exec.sorted")"
+        p95="$(sed -n "$(( i95 + 1 ))p" "$tmpd/$effsafe2.exec.sorted")"
+        [ -z "$p50" ] && p50="-"
+        [ -z "$p95" ] && p95="-"
+      fi
+    fi
+
+    printf '%-14s %5s %5s %6s %9s %7s %5s %5s\n' \
+      "$eff2" "$total" "$done" "$failed" "$cancelled" "$succ" "$p50" "$p95"
+  done
+
+  rm -rf "$tmpd"
+  return 0
+}
