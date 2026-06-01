@@ -1776,18 +1776,29 @@ _cmux_v5_flow_exec_node() {
   case "$target" in
     @*)
       local routed
+      # 전역 route 락으로 동시 wave 의 라우터들을 직렬화. 라우팅 직후 같은 임계영역에서
+      # DISPATCHING 까지 기록해야 다음 라우터가 이 노드를 busy(DISPATCHING+RUNNING)로 보고
+      # 다른 surface 로 분산한다. 락이 없으면 동시 라우터가 같은 PENDING 스냅샷을 보고
+      # 모두 enum-first 를 골라 한 surface 로 쏠린다(스냅샷 레이스). run_node 같은
+      # 느린 작업은 아래에서 락 해제 후 수행하므로 wave 병렬성은 유지된다.
+      _cmux_v5_lock "cmux-route" 30
       routed="$(_cmux_v5_route "$target")"
       rc=$?
       if [ "$rc" -ne 0 ] || [ -z "$routed" ]; then
+        _cmux_v5_unlock "cmux-route"
         _cmux_v5_job_set_state "$jobid" FAILED
         printf '[cmux v5] flow node %s: cannot route %s\n' "$nodeid" "$target" >&2
         return 0
       fi
       _cmux_v5_job_set_meta "$jobid" routed_to "$routed"
       target="$routed"
+      _cmux_v5_job_set_state "$jobid" DISPATCHING
+      _cmux_v5_unlock "cmux-route"
+      ;;
+    *)
+      _cmux_v5_job_set_state "$jobid" DISPATCHING
       ;;
   esac
-  _cmux_v5_job_set_state "$jobid" DISPATCHING
   _cmux_v5_job_set_state "$jobid" RUNNING
   # rc/stdout 위생: local 대입 분리 (zsh 무대입 재선언 stdout 오염 회피는 상단 1회 선언으로 처리).
   out="$(_cmux_v5_flow_run_node "$target" "$prompt")"
