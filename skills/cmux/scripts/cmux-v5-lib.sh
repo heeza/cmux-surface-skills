@@ -116,6 +116,8 @@ _cmux_v5_garbage_collect() {
   [ "$_CMUX_V5_GC_DONE" = "1" ] && return 0
   _CMUX_V5_GC_DONE=1
   find "$CMUX_V5_FIFO_DIR" -type p -mmin +720 -delete 2>/dev/null &
+  # 회수 안 된 .ans/.ans.tmp(늦은 답 잔재) 도 같은 TTL 로 정리.
+  find "$CMUX_V5_FIFO_DIR" -type f \( -name '*.ans' -o -name '*.ans.tmp' \) -mmin +720 -delete 2>/dev/null &
   # stale lock 디렉터리 백스톱 정리: ts-file 내용 기반 stale 은 acquire 시 break 하므로
   # 여기선 디렉터리 mtime 이 TTL 보다 오래된 *.lock 만 coarse 하게 제거.
   [ -d "$CMUX_V5_LOCK_DIR" ] && find "$CMUX_V5_LOCK_DIR" -type d -name '*.lock' -mmin +$(( ${CMUX_V5_LOCK_TTL:-300} / 60 + 1 )) -exec rm -rf {} + 2>/dev/null &
@@ -538,6 +540,48 @@ _cmux_v5_screen_extract() {
   '
 }
 
+# 응답자(LLM)가 실행할 표준 기록 명령 블록.
+#   답을 .ans 에 atomic(temp+rename) 기록 후 파이프가 살아있을 때만(`[ -p $fifo ]`)
+#   FIFO 로 push 한다. → reader timeout 이후엔 orphan .res 를 만들지 않고(가드),
+#   늦게 쓴 답도 .ans 에 영속되어 collector 가 회수한다(유실 차단).
+_cmux_v5_write_cmd() {
+  local fifo="$1" delim="$2" ans
+  ans="${fifo%.res}.ans"
+  cat <<EOF
+cat > $ans.tmp <<'$delim'
+여기에 실제 답변 작성 (이 줄을 너의 답으로 교체, 비우지 말 것)
+$delim
+mv -f $ans.tmp $ans
+EOF
+}
+
+# .ans 폴링 reader — FIFO blocking rendezvous 대신 atomic .ans 파일이 나타날 때까지
+#   짧은 간격으로 폴링한다. async(send→나중 collect)·sync(ask) 모두 동일하게 동작하고,
+#   응답자가 파이프 reader 유무와 무관히 답을 쓰므로 codex/agy/minimax(pi) 등 모든
+#   sidecar 에서 견고하다. mv 가 atomic 이라 torn read 없음.
+#   rc: 0=수신, 124=timeout, 125=surface gone(early give-up).
+_cmux_v5_await_ans() {
+  local ans="$1" timeout="$2" rmax="$3" surface="${4:-}"
+  local deadline body
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    if [ -s "$ans" ]; then
+      body="$(head -c "$rmax" "$ans" 2>/dev/null)"
+      # 응답자가 heredoc 구분자(CMUX_END_…)를 본문 끝에 누출하는 경우 제거.
+      body="${body%$'\n'}"
+      case "$body" in
+        *$'\n'CMUX_END_*) body="${body%$'\n'CMUX_END_*}" ;;
+        CMUX_END_*) body="" ;;
+      esac
+      printf '%s' "$body"
+      return 0
+    fi
+    [ -n "$surface" ] && ! _cmux_v5_surface_alive "$surface" && return 125
+    [ "$(date +%s)" -ge "$deadline" ] && return 124
+    sleep 0.2
+  done
+}
+
 _cmux_v5_llm_prompt() {
   local body="$1" fifo="$2" job="$3" delim token
   if [ "$CMUX_V5_AUTO_CAP" = "on" ]; then
@@ -549,10 +593,8 @@ _cmux_v5_llm_prompt() {
 $body
 
 [규칙 — 우선순위 순]
-1. Bash 호출 가능하면 마지막 Bash 호출로 답변을 FIFO 에 기록 (chat 출력 X). 가운데 줄을 실제 답으로 교체, 비우지 말 것:
-    cat > $fifo <<'$delim'
-    여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
-    $delim
+1. Bash 호출 가능하면 마지막 Bash 호출로 아래 명령을 그대로 실행(가운데 답변 줄만 교체, chat 출력 X):
+$(_cmux_v5_write_cmd "$fifo" "$delim")
 2. Bash 호출 불가하면 chat 에 아래 두 마커 사이에 실제 답을 출력:
    === CMUX_${token}_BEGIN ===
    여기에 실제 답변
@@ -566,9 +608,7 @@ $body
 [cmux]
 반드시 마지막 Bash 도구 호출 1번으로 답변을 FIFO 에만 기록. chat 출력 금지.
 가운데 줄을 너의 실제 답변으로 교체하라 — 절대 비워두지 말 것:
-cat > $fifo <<'$delim'
-여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
-$delim
+$(_cmux_v5_write_cmd "$fifo" "$delim")
 답변은 간결하게.
 EOF
       fi
@@ -577,9 +617,7 @@ EOF
 $body
 
 [cmux] 답을 짧게. 가능하면 마지막 Bash 호출로 FIFO 에만 기록 — 가운데 줄을 실제 답으로 교체, 비우지 말 것:
-cat > $fifo <<'$delim'
-여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
-$delim
+$(_cmux_v5_write_cmd "$fifo" "$delim")
 Bash 불가하면 chat 에 아래 두 마커 사이에 실제 답을 출력:
 === CMUX_${token}_BEGIN ===
 여기에 실제 답변
@@ -590,9 +628,7 @@ EOF
 $body
 
 [cmux] 위 질문의 답을 짧게. 반드시 마지막 Bash 도구 호출 1번으로 아래 명령을 실행해 FIFO 파일에만 기록하라(chat 출력 금지). 첫/마지막 줄(구분자 $delim)은 그대로 두고, 가운데 줄을 너의 실제 답변으로 교체하라 — 절대 비워두지 말 것:
-cat > $fifo <<'$delim'
-여기에 실제 답변 작성 (이 줄을 너의 답으로 교체)
-$delim
+$(_cmux_v5_write_cmd "$fifo" "$delim")
 EOF
     fi
   else
@@ -601,10 +637,13 @@ EOF
 }
 
 _cmux_v5_worker_prompt() {
-  local body="$1" fifo="$2"
+  local body="$1" fifo="$2" ans
+  ans="${fifo%.res}.ans"
   if [ "$CMUX_V5_AUTO_CAP" = "on" ]; then
-    # body 가 단일 shell command. 그대로 redirect.
-    printf '{ %s ; } > %s 2>&1\n' "$body" "$fifo"
+    # body 출력을 .ans 에 atomic(temp+rename) 기록. 블로킹 가능한 FIFO push 는 하지 않음
+    # (collector 가 .ans 를 폴링). reader 유무와 무관해 worker 턴이 멈추지 않는다.
+    printf '{ %s ; } > %s.tmp 2>&1; mv -f %s.tmp %s\n' \
+      "$body" "$ans" "$ans" "$ans"
   else
     printf '%s\n' "$body"
   fi
@@ -835,12 +874,16 @@ _cmux_v5_dispatch() {
 
   local out rc start elapsed mark
   start=$(date +%s)
-  out="$(_cmux_v5_read_fifo_dynamic "$fifo" "$surface" "$mode" "$timeout" "$rmax")"
+  # 응답 수신은 .ans 파일 폴링(primary). FIFO(.res)는 pending-job 마커로만 쓰고
+  # blocking read 하지 않는다 → 응답자가 reader 유무와 무관히 답을 쓰므로 안 멈춘다.
+  local ans="${fifo%.res}.ans" used_ans=0
+  out="$(_cmux_v5_await_ans "$ans" "$timeout" "$rmax" "$surface")"
   rc=$?
+  [ "$rc" -eq 0 ] && used_ans=1
   elapsed=$(( $(date +%s) - start ))
-  rm -f "$fifo"
+  rm -f "$fifo" "$ans"
 
-  # Fallback: LLM 모드 + FIFO 무응답이면 screen 마커 추출 시도.
+  # Fallback B: LLM 모드 + 그래도 비었으면 screen 마커 추출 시도(opt-in).
   local used_screen=0
   if [ "${CMUX_V5_FALLBACK_SCREEN:-off}" = "on" ] \
      && [ "$mode" = "llm" ] \
@@ -1009,12 +1052,15 @@ _cmux_v5_collect_one() {
 
   local out rc start elapsed mark
   start=$(date +%s)
-  out="$(_cmux_v5_read_fifo_dynamic "$fifo" "$surface" "" "$timeout" "$rmax")"
+  # 응답 수신은 .ans 파일 폴링(primary). FIFO(.res)는 pending-job 마커로만.
+  local ans="${fifo%.res}.ans" used_ans=0
+  out="$(_cmux_v5_await_ans "$ans" "$timeout" "$rmax" "$surface")"
   rc=$?
+  [ "$rc" -eq 0 ] && used_ans=1
   elapsed=$(( $(date +%s) - start ))
-  rm -f "$fifo"
+  rm -f "$fifo" "$ans"
 
-  # Fallback: FIFO 무응답이고 surface 알면 screen 마커 추출 시도.
+  # Fallback B: 그래도 비었고 surface 알면 screen 마커 추출 시도(opt-in).
   local used_screen=0
   if [ "${CMUX_V5_FALLBACK_SCREEN:-off}" = "on" ] \
      && { [ "$rc" -ne 0 ] || [ "${#out}" -eq 0 ]; } \
@@ -1151,6 +1197,20 @@ cmux_collect() {
     _cmux_v5_collect_one "$direct_fifo" "$timeout" "$rmax"
     return $?
   fi
+  # Mode 2b: FIFO 는 이미 사라졌지만(직전 collect timeout 후 rm), 응답자가 그 뒤
+  #   늦게 .ans 에 답을 남겼을 수 있다 → 교차호출 복구로 회수.
+  local direct_ans
+  direct_ans="${direct_fifo%.res}.ans"
+  if [ -s "$direct_ans" ]; then
+    local ans_out
+    ans_out="$(head -c "$rmax" "$direct_ans" 2>/dev/null)"
+    rm -f "$direct_ans"
+    if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+      printf '[cmux v5] collect %s 0s %dB ok,ans-fallback\n' "$target" "${#ans_out}" >&2
+    fi
+    printf '%s' "$ans_out"
+    return 0
+  fi
 
   # Mode 3/4: surface:N 또는 title → 가장 최근 pending
   local surface
@@ -1178,19 +1238,18 @@ cmux_check() {
       *) printf '[cmux v5] unknown arg: %s\n' "$1" >&2; return 2 ;;
     esac
   done
-  local fifo
+  local fifo ans
   fifo="$(_cmux_v5_fifo_path "$job")"
-  [ -p "$fifo" ] || return 2
-  perl - "$fifo" "$wait_s" "$interval" <<'PERL'
+  ans="${fifo%.res}.ans"
+  # pending 마커(.res)도 .ans 도 없으면 그런 job 없음.
+  { [ -p "$fifo" ] || [ -e "$ans" ]; } || return 2
+  # 준비 판정 = .ans 가 non-empty 로 나타남(응답자가 atomic mv 로 기록 완료).
+  perl - "$ans" "$wait_s" "$interval" <<'PERL'
 use Time::HiRes qw(time sleep);
-my ($fifo, $wait_s, $interval) = @ARGV;
+my ($ans, $wait_s, $interval) = @ARGV;
 my $deadline = time + $wait_s;
 while (1) {
-  # FIFO를 직접 open하지 않고, lsof로 이 FIFO를 open하고 있는 프로세스(writer)가 있는지 확인 (Destructive race condition 방지)
-  my $lsof = `lsof -t "$fifo" 2>/dev/null`;
-  if ($lsof) {
-    exit 0;
-  }
+  if (-s $ans) { exit 0; }
   last if time >= $deadline;
   sleep $interval;
 }
