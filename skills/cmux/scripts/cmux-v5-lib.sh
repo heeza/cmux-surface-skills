@@ -555,6 +555,30 @@ mv -f $ans.tmp $ans
 EOF
 }
 
+# .ans 파일 1개를 rmax 캡 + heredoc 구분자(CMUX_END_) 누출 strip 후 stdout 출력.
+_cmux_v5_read_ans_file() {
+  local ans="$1" rmax="$2" body
+  body="$(head -c "$rmax" "$ans" 2>/dev/null)"
+  body="${body%$'\n'}"
+  case "$body" in
+    *$'\n'CMUX_END_*) body="${body%$'\n'CMUX_END_*}" ;;
+    CMUX_END_*) body="" ;;
+  esac
+  printf '%s' "$body"
+}
+
+# surface 의 가장 최근 non-empty .ans path(이미 답이 쓰인 것). 없으면 rc1.
+#   .res 마커가 이미 정리된 고아 .ans 도 잡으므로 by-surface collect 가 회수 가능.
+_cmux_v5_pick_ans() {
+  local surface="$1"
+  [ -z "$surface" ] && return 1
+  local prefix="${surface/:/_}" f
+  for f in $(ls -t "$CMUX_V5_FIFO_DIR/${prefix}-"*.ans 2>/dev/null); do
+    [ -s "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
 # .ans 폴링 reader — FIFO blocking rendezvous 대신 atomic .ans 파일이 나타날 때까지
 #   짧은 간격으로 폴링한다. async(send→나중 collect)·sync(ask) 모두 동일하게 동작하고,
 #   응답자가 파이프 reader 유무와 무관히 답을 쓰므로 codex/agy/minimax(pi) 등 모든
@@ -562,18 +586,11 @@ EOF
 #   rc: 0=수신, 124=timeout, 125=surface gone(early give-up).
 _cmux_v5_await_ans() {
   local ans="$1" timeout="$2" rmax="$3" surface="${4:-}"
-  local deadline body
+  local deadline
   deadline=$(( $(date +%s) + timeout ))
   while :; do
     if [ -s "$ans" ]; then
-      body="$(head -c "$rmax" "$ans" 2>/dev/null)"
-      # 응답자가 heredoc 구분자(CMUX_END_…)를 본문 끝에 누출하는 경우 제거.
-      body="${body%$'\n'}"
-      case "$body" in
-        *$'\n'CMUX_END_*) body="${body%$'\n'CMUX_END_*}" ;;
-        CMUX_END_*) body="" ;;
-      esac
-      printf '%s' "$body"
+      _cmux_v5_read_ans_file "$ans" "$rmax"
       return 0
     fi
     [ -n "$surface" ] && ! _cmux_v5_surface_alive "$surface" && return 125
@@ -1133,7 +1150,7 @@ cmux_collect() {
       printf '[cmux v5] mktemp failed\n' >&2; return 1
     }
     # 지역변수 1회 선언 (zsh: 값 있는 변수의 무대입 `local` 재선언은 stdout 오염).
-    local found=0 n=0 fifo nm surface title hdr
+    local found=0 n=0 fifo nm surface title hdr af ajob
     for fifo in "$CMUX_V5_FIFO_DIR"/*.res; do
       [ -e "$fifo" ] || continue
       # FIFO 가 아닌 잔재 (regular file 등) 는 그냥 unlink + 스킵.
@@ -1157,6 +1174,28 @@ cmux_collect() {
       # body→$n.out, status(stderr)→$n.err, rc→$n.rc 로 격리 후 background 회수.
       ( _cmux_v5_collect_one "$fifo" "$timeout" "$rmax" > "$tmpd/$n.out" 2> "$tmpd/$n.err"
         printf '%s' "$?" > "$tmpd/$n.rc" ) &
+    done
+
+    # 고아 .ans (대응 .res 가 이미 정리된 = 답은 쓰였지만 회수 안 된) 도 회수.
+    #   이미 답이 있으니 폴링 불필요 → 동기 회수(.rc=0 즉시 기록).
+    for af in "$CMUX_V5_FIFO_DIR"/*.ans; do
+      [ -e "$af" ] || continue
+      ajob="${af##*/}"; ajob="${ajob%.ans}"
+      # 대응 .res 가 아직 있으면 위 .res 루프가 처리하므로 스킵.
+      [ -e "$CMUX_V5_FIFO_DIR/$ajob.res" ] && continue
+      [ -s "$af" ] || { rm -f "$af"; continue; }   # 빈 .ans 는 정리만
+      found=1
+      n=$((n+1))
+      surface="$(_cmux_v5_fifo_to_surface "$ajob.res")"
+      title=""
+      [ -n "$surface" ] && title="$(_cmux_v5_surface_title "$surface")"
+      if [ -n "$title" ]; then hdr="$title ($surface)"
+      elif [ -n "$surface" ]; then hdr="$surface"
+      else hdr="$ajob"; fi
+      printf '%s' "$hdr" > "$tmpd/$n.hdr"
+      _cmux_v5_read_ans_file "$af" "$rmax" > "$tmpd/$n.out"
+      printf '0' > "$tmpd/$n.rc"
+      rm -f "$af"
     done
 
     if [ "$found" -eq 0 ]; then
@@ -1203,18 +1242,32 @@ cmux_collect() {
   direct_ans="${direct_fifo%.res}.ans"
   if [ -s "$direct_ans" ]; then
     local ans_out
-    ans_out="$(head -c "$rmax" "$direct_ans" 2>/dev/null)"
+    ans_out="$(_cmux_v5_read_ans_file "$direct_ans" "$rmax")"
     rm -f "$direct_ans"
     if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
-      printf '[cmux v5] collect %s 0s %dB ok,ans-fallback\n' "$target" "${#ans_out}" >&2
+      printf '[cmux v5] collect %s 0s %dB ok,ans\n' "$target" "${#ans_out}" >&2
     fi
     printf '%s' "$ans_out"
     return 0
   fi
 
-  # Mode 3/4: surface:N 또는 title → 가장 최근 pending
+  # Mode 3/4: surface:N 또는 title
   local surface
   surface="$(_cmux_v5_resolve "$target")" || return 6
+  # 1) 이미 답이 쓰인 .ans(.res 마커가 정리된 고아 포함)가 있으면 즉시 회수(가장 최근).
+  #    pending .res 가 더 최신이라도, 이미 받은 답을 먼저 돌려주는 게 유용하다.
+  local ready_ans ready_out
+  ready_ans="$(_cmux_v5_pick_ans "$surface")"
+  if [ -n "$ready_ans" ]; then
+    ready_out="$(_cmux_v5_read_ans_file "$ready_ans" "$rmax")"
+    rm -f "$ready_ans" "${ready_ans%.ans}.res"
+    if [ "${CMUX_V5_QUIET:-off}" != "on" ]; then
+      printf '[cmux v5] collect %s 0s %dB ok,ans\n' "$surface" "${#ready_out}" >&2
+    fi
+    printf '%s' "$ready_out"
+    return 0
+  fi
+  # 2) 없으면 pending .res job 폴링.
   local fifo
   fifo="$(_cmux_v5_pick_fifo "$surface")" || {
     printf '[cmux v5] no pending job for %s\n' "$surface" >&2
