@@ -95,3 +95,29 @@ YAML
 3. P1 job 레코드 디렉터리 스킴 + `cmux_collect`/`check`를 레코드 기반으로 리팩터(FIFO는 전송 채널로만 강등).
 4. P2 `cmux_flow` MVP: 위상정렬 + 준비노드 broadcast + 결과 템플릿 주입.
 5. P4 `events.ndjson` + `cmux_trace`로 P2를 가시화한 뒤 P3 라우팅 착수.
+
+---
+
+## 4. 구현 현황 (이 브랜치 `fix/cmux-orchestrator-p0`)
+
+전 단계 구현 완료. 모든 변경은 **추가형**이며 기존 public 함수
+(`cmux_ask`/`send`/`collect`/`check`/`cross`/`broadcast`)와 FIFO 동작은 불변.
+bash·zsh 양쪽에서 `-n` 및 기능 테스트 통과.
+
+| 단계 | 상태 | 핵심 산출물 |
+|---|---|---|
+| cross 버그 핫픽스 | ✅ | `cmux_cross --rounds` 인자 파싱 수정 |
+| P0-1 포터블 락 | ✅ | `_cmux_v5_lock`/`_unlock` (mkdir mutex, dead-pid 우선 stale, GC 백스톱) |
+| P1 Job 레지스트리 | ✅ | `_cmux_v5_job_*` — `/tmp/cmux-jobs/<id>/{meta,state,result,events.ndjson}` 상태머신, 전 변이 락-가드 + temp+mv 원자교체 |
+| P2 DAG 스케줄러 | ✅ | `cmux_flow` — TAB DSL, 위상정렬, 병렬 wave, `{{id.result}}` 템플릿, 실패 격리, cycle/unknown 거부 |
+| P3 라우팅/LB | ✅ | `_cmux_v5_route`/`route_retry` — `@cap` 셀렉터 → 최소 busy surface, retry 제외, flow `@cap` 훅(`routed_to`). **wave 내 라우팅은 전역 `cmux-route` 락으로 직렬화**해 동시 fan-out 도 분산 |
+| P4 관측가능성 | ✅ | `cmux_trace`(노드별 WAIT/EXEC/TOTAL + ASCII gantt), `cmux_metrics`(surface별 성공률·p50/p95) |
+
+### 신규 public 함수
+`cmux_flow`, `cmux_trace`, `cmux_metrics`. (그 외는 모두 `_cmux_v5_*` private.)
+
+### 알려진 한계 / 후속 과제
+- **percentile 정밀도**: 정수 초 단위 exec 시간 기반. 더 세밀하면 `events.ndjson` 에 ms 도입 필요(현재 `date +%s`, `%N` 회피).
+- **선재 이슈**: 기존 `_cmux_v5_job` 의 `date +%s%N` 는 macOS 에서 `%N` 미지원(리터럴 `N`). 이번 범위 밖, 별도 추적.
+- **cmux_flow ↔ 라이브 surface**: 테스트는 `_cmux_v5_flow_run_node` 스텁으로 DAG/라우팅/관측 로직만 검증. 실제 surface 연동 E2E 는 별도.
+- **template 교차 주입**: dep result 가 다른 dep 의 `{{id}}` 토큰을 문자 그대로 포함하면 순차 치환 중 재주입 가능(실사용 드묾, 문서화된 한계).
