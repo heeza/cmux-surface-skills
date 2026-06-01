@@ -36,6 +36,8 @@
 : "${CMUX_V5_LOCK_DIR:=/tmp/cmux-locks}"   # advisory lock 디렉터리
 : "${CMUX_V5_LOCK_TTL:=300}"               # stale lock 판정 초(소유 PID 사망 OR age>TTL)
 : "${CMUX_V5_LOCK_WAIT:=10}"               # acquire 재시도 최대 대기 초
+: "${CMUX_V5_JOB_DIR:=/tmp/cmux-jobs}"     # job 레지스트리 루트
+: "${CMUX_V5_JOB_TTL_MIN:=720}"            # job 레코드 GC 분(기본 12h)
 
 # ---- private ----
 
@@ -44,6 +46,7 @@ _CMUX_V5_TREE_CACHE_TIME=0
 _CMUX_V5_TREE_FOCUSED_CACHE=""
 _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
 _CMUX_V5_GC_DONE=0
+_CMUX_V5_JOBGC_DONE=0
 
 _cmux_v5_get_tree() {
   local now
@@ -203,6 +206,198 @@ _cmux_v5_unlock() {
   if [ "$pid" = "$$" ]; then
     rm -rf "$lockpath" 2>/dev/null
   fi
+  return 0
+}
+
+# ---- job 레지스트리 ----
+# DAG 스케줄러가 소비할 토대. 기존 public 함수/FIFO 동작과 완전 독립인 additive 레이어.
+# 디스크 레이아웃:
+#   $CMUX_V5_JOB_DIR/<jobid>/
+#     meta          # KEY=VALUE 라인 (grep 가능, JSON 이스케이프 회피)
+#     state         # 단일 토큰 (빠른 읽기용, meta 와 중복 저장)
+#     result        # 응답 본문 raw (이스케이프 없이 verbatim)
+#     events.ndjson # 한 줄당 {"ts":N,"from":"S","to":"S"} (필드가 통제되어 hand-built JSON 안전)
+# meta 파싱 규칙: 읽기는 `^KEY=` 첫 매치 라인을 grep 후 prefix strip.
+#   upsert 는 lock 하에 그 키 라인을 제외하고 재작성 후 KEY=VALUE 추가(temp+mv 원자 교체).
+#   값은 단일 라인만 허용(개행 포함 시 거부).
+
+# 유효 상태 집합. terminal: DONE FAILED CANCELLED.
+_CMUX_V5_JOB_STATES="PENDING DISPATCHING RUNNING DONE FAILED CANCELLED"
+
+# new_state 가 enum 에 속하면 0, 아니면 1.
+# zsh 는 unquoted $var 를 word-split 하지 않으므로(bash 와 차이), for-in 대신
+# 양쪽 끝을 공백으로 패딩한 case 매칭으로 토큰 포함 여부를 셸 무관하게 판정한다.
+_cmux_v5_job_valid_state() {
+  case " $_CMUX_V5_JOB_STATES " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# _cmux_v5_job_dir <jobid> -> $CMUX_V5_JOB_DIR/<jobid>. 빈/슬래시 jobid 거부(rc 1).
+_cmux_v5_job_dir() {
+  local jobid="$1"
+  case "$jobid" in ''|*/*) return 1 ;; esac
+  printf '%s/%s' "$CMUX_V5_JOB_DIR" "$jobid"
+}
+
+# _cmux_v5_job_new <jobid> <target> [deps] [deadline]
+#   job 디렉터리 + meta + state=PENDING + 빈 result + 최초 이벤트(from="" to="PENDING") 생성.
+#   lock 으로 create race 차단. 이미 존재하면 clobber 없이 rc 1.
+_cmux_v5_job_new() {
+  local jobid="$1" target="$2" deps="${3:-}" deadline="${4:-}"
+  local dir created now
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  # 단일 라인 보장: target/deps/deadline 에 개행 있으면 거부 (락 획득 전).
+  case "$target$deps$deadline" in *"
+"*) return 1 ;; esac
+  _cmux_v5_lock "job-$jobid" || return 1
+  if [ -d "$dir" ]; then
+    _cmux_v5_unlock "job-$jobid"
+    return 1
+  fi
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    _cmux_v5_unlock "job-$jobid"
+    return 1
+  fi
+  created="$(date +%s)"
+  now="$created"
+  {
+    printf 'id=%s\n' "$jobid"
+    printf 'target=%s\n' "$target"
+    printf 'prompt_hash=\n'
+    printf 'deps=%s\n' "$deps"
+    printf 'state=PENDING\n'
+    printf 'attempts=0\n'
+    printf 'created=%s\n' "$created"
+    printf 'deadline=%s\n' "$deadline"
+  } > "$dir/meta"
+  printf 'PENDING' > "$dir/state.tmp" && mv -f "$dir/state.tmp" "$dir/state"
+  : > "$dir/result"
+  printf '{"ts":%s,"from":"","to":"PENDING"}\n' "$now" > "$dir/events.ndjson"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_get <jobid> <key> -> meta 의 KEY 값(없으면 빈). 단일 라인 원자 읽기라 lock 불필요.
+_cmux_v5_job_get() {
+  local jobid="$1" key="$2" dir line
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -f "$dir/meta" ] || return 0
+  line="$(grep "^${key}=" "$dir/meta" 2>/dev/null | head -1)"
+  [ -z "$line" ] && return 0
+  printf '%s' "${line#*=}"
+}
+
+# _cmux_v5_job_state <jobid> -> state 파일의 현재 토큰(없으면 빈).
+_cmux_v5_job_state() {
+  local jobid="$1" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -f "$dir/state" ] || return 0
+  cat "$dir/state" 2>/dev/null
+}
+
+# _cmux_v5_job_set_meta <jobid> <key> <value>
+#   meta 의 KEY=VALUE 라인을 lock 하에 upsert(없으면 추가, 있으면 교체). 정확히 한 줄 보장.
+#   key 에 '=' 또는 개행 포함 시 rc 2. value 에 개행 포함 시 rc 2.
+_cmux_v5_job_set_meta() {
+  local jobid="$1" key="$2" value="$3" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  case "$key" in *'='*|*"
+"*) return 2 ;; esac
+  case "$value" in *"
+"*) return 2 ;; esac
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  # grep -v 는 전부 필터되면 rc 1 → && 체이닝 금지(단일키 파일에서 abort 방지).
+  grep -v "^${key}=" "$dir/meta" 2>/dev/null > "$dir/meta.tmp"
+  printf '%s=%s\n' "$key" "$value" >> "$dir/meta.tmp"
+  mv -f "$dir/meta.tmp" "$dir/meta"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_set_state <jobid> <new_state>
+#   enum 검증(아니면 rc 2). lock 하에 old 읽기 → state 파일 + meta state= 둘 다 갱신 →
+#   events.ndjson 에 이벤트 추가. 동일 상태 재기록도 이벤트를 그대로 append 한다(idempotent 비강제).
+_cmux_v5_job_set_state() {
+  local jobid="$1" new_state="$2" dir old now
+  _cmux_v5_job_valid_state "$new_state" || return 2
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  old="$(cat "$dir/state" 2>/dev/null)"
+  now="$(date +%s)"
+  # state 파일도 temp+mv 로 원자 교체 — lock-free reader 의 torn read 차단.
+  printf '%s' "$new_state" > "$dir/state.tmp" && mv -f "$dir/state.tmp" "$dir/state"
+  # meta 의 state= 라인 upsert (lock 재진입 회피 위해 인라인 처리).
+  grep -v "^state=" "$dir/meta" 2>/dev/null > "$dir/meta.tmp"
+  printf 'state=%s\n' "$new_state" >> "$dir/meta.tmp"
+  mv -f "$dir/meta.tmp" "$dir/meta"
+  printf '{"ts":%s,"from":"%s","to":"%s"}\n' "$now" "$old" "$new_state" >> "$dir/events.ndjson"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_incr_attempts <jobid> -> lock 하에 attempts+1 기록. 새 카운트 출력.
+_cmux_v5_job_incr_attempts() {
+  local jobid="$1" dir cur next line
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  line="$(grep "^attempts=" "$dir/meta" 2>/dev/null | head -1)"
+  cur="${line#*=}"
+  case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  next=$((cur + 1))
+  grep -v "^attempts=" "$dir/meta" 2>/dev/null > "$dir/meta.tmp"
+  printf 'attempts=%s\n' "$next" >> "$dir/meta.tmp"
+  mv -f "$dir/meta.tmp" "$dir/meta"
+  _cmux_v5_unlock "job-$jobid"
+  printf '%s' "$next"
+}
+
+# _cmux_v5_job_set_result <jobid> <body> -> result 파일에 body verbatim 기록(단일 writer 가정, 안전상 lock).
+_cmux_v5_job_set_result() {
+  local jobid="$1" body="$2" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -d "$dir" ] || return 1
+  _cmux_v5_lock "job-$jobid" || return 1
+  # result 도 원자 교체 — lock-free get_result 의 torn read 차단.
+  printf '%s' "$body" > "$dir/result.tmp" && mv -f "$dir/result.tmp" "$dir/result"
+  _cmux_v5_unlock "job-$jobid"
+  return 0
+}
+
+# _cmux_v5_job_get_result <jobid> -> result 파일 cat(없으면 빈).
+_cmux_v5_job_get_result() {
+  local jobid="$1" dir
+  dir="$(_cmux_v5_job_dir "$jobid")" || return 1
+  [ -f "$dir/result" ] || return 0
+  cat "$dir/result" 2>/dev/null
+}
+
+# _cmux_v5_job_list [state] -> jobid(디렉터리 basename) 출력. state 인자 시 그 상태만 필터.
+_cmux_v5_job_list() {
+  local filter="${1:-}" d base st
+  [ -d "$CMUX_V5_JOB_DIR" ] || return 0
+  for d in "$CMUX_V5_JOB_DIR"/*; do
+    [ -d "$d" ] || continue
+    base="${d##*/}"
+    if [ -n "$filter" ]; then
+      st="$(cat "$d/state" 2>/dev/null)"
+      [ "$st" = "$filter" ] || continue
+    fi
+    printf '%s\n' "$base"
+  done
+}
+
+# _cmux_v5_job_gc -> TTL(분) 초과 job 디렉터리를 백그라운드 비차단 제거. 셸 세션당 1회만.
+#   -mindepth 1 로 루트 자체 삭제 방지(BSD-safe).
+_cmux_v5_job_gc() {
+  [ "$_CMUX_V5_JOBGC_DONE" = "1" ] && return 0
+  _CMUX_V5_JOBGC_DONE=1
+  [ -d "$CMUX_V5_JOB_DIR" ] || return 0
+  find "$CMUX_V5_JOB_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +"${CMUX_V5_JOB_TTL_MIN:-720}" -exec rm -rf {} + 2>/dev/null &
   return 0
 }
 
