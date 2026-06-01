@@ -24,7 +24,7 @@
 # ---- defaults (env override 가능) ----
 : "${CMUX_V5_PROMPT_MAX:=500}"      # prompt 글자 cap
 : "${CMUX_V5_RESPONSE_MAX:=4096}"   # 응답 바이트 cap
-: "${CMUX_V5_TIMEOUT:=1200}"        # blocking read 초
+: "${CMUX_V5_TIMEOUT:=1800}"        # 응답 대기(.ans 폴링) 최대 초 — 기본 30분
 : "${CMUX_V5_AUTO_CAP:=on}"         # on|off — prompt 끝에 안내문 자동 첨부
 : "${CMUX_V5_TREE_TTL:=3}"          # cmux tree 캐시 TTL(초). resolve→detect→dynamic 간 tree fork 재사용
 : "${CMUX_V5_FIFO_DIR:=/tmp/cmux-fifo}"
