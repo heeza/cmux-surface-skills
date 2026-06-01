@@ -38,6 +38,7 @@
 : "${CMUX_V5_LOCK_WAIT:=10}"               # acquire 재시도 최대 대기 초
 : "${CMUX_V5_JOB_DIR:=/tmp/cmux-jobs}"     # job 레지스트리 루트
 : "${CMUX_V5_JOB_TTL_MIN:=720}"            # job 레코드 GC 분(기본 12h)
+: "${CMUX_V5_FLOW_MAX_NODES:=64}"          # cmux_flow DAG 노드 안전 상한
 
 # ---- private ----
 
@@ -1600,4 +1601,325 @@ EOF
   done
   rm -rf "$tmpd"
   return "$worst"
+}
+
+# ---- cmux_flow (P2 DAG 스케줄러) ----
+# P1 job 레지스트리 위에 얹는 의존성 그래프 스케줄러. 기존 public 함수와 완전 독립인 additive 레이어.
+# stdin (또는 파일 인자) 의 TAB 구분 DSL 을 소비:
+#   <id>\t<target>\t<deps>\t<prompt>
+#   - id    : [A-Za-z0-9_-]+ (그 외 거부)
+#   - target: dispatch 로 그대로 전달되는 surface ref / title
+#   - deps  : 쉼표 구분 node id 목록, 또는 '-' (없음)
+#   - prompt: 4번째 필드부터 끝까지(내부 TAB 보존)
+#   '#' 주석/빈 줄 무시.
+# 동작:
+#   ready node(모든 dep DONE)를 파도(wave)마다 병렬 실행. 결과는 템플릿 치환으로 dependent 에 주입.
+#   실패는 격리: dep 이 FAILED/CANCELLED 인 node 는 CANCELLED 로 전파(cascade), 독립 분기는 계속.
+# 모든 노드↔서브셸 통신은 on-disk 레지스트리(lock 보호)로만 이뤄지므로 background &+wait 가 안전하다.
+
+# 프로세스 전역 카운터 — 같은 프로세스/같은 초 내 다중 cmux_flow 호출의 flowid 충돌 방지.
+_CMUX_V5_FLOW_COUNTER=0
+
+# _cmux_v5_flow_run_node <target> <prompt>
+#   실제 dispatch 본체. 테스트가 override 할 수 있도록 별도 tiny 함수로 분리(cmux_ask 인라인 금지).
+#   stdout=응답, rc=dispatch rc.
+_cmux_v5_flow_run_node() {
+  cmux_ask "$1" "$2"
+}
+
+# 콤마구분 문자열을 한 줄에 하나씩 출력(빈 토큰 제거). bash/zsh 양쪽에서 word-split 의존 없이 동작.
+# printf '%s' 는 마지막 토큰에 개행을 붙이지 않으므로 read 조건에 || [ -n "$_d" ] 추가.
+_cmux_v5_flow_split_deps() {
+  printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r _d; do
+    [ -n "$_d" ] && printf '%s\n' "$_d"
+  done
+}
+
+# _cmux_v5_flow_exec_node <flowid> <nodeid> <target> <prompt>
+#   단일 노드 실행: DISPATCHING → RUNNING → run_node 호출 → rc0 이면 result 기록 + DONE, 아니면 FAILED.
+#   background 서브셸에서 호출되며, 상태/결과는 전부 레지스트리에 기록한다.
+_cmux_v5_flow_exec_node() {
+  local flowid="$1" nodeid="$2" target="$3" prompt="$4"
+  local jobid out rc
+  jobid="${flowid}__${nodeid}"
+  _cmux_v5_job_set_state "$jobid" DISPATCHING
+  _cmux_v5_job_set_state "$jobid" RUNNING
+  # rc/stdout 위생: local 대입 분리 (zsh 무대입 재선언 stdout 오염 회피는 상단 1회 선언으로 처리).
+  out="$(_cmux_v5_flow_run_node "$target" "$prompt")"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    _cmux_v5_job_set_result "$jobid" "$out"
+    _cmux_v5_job_set_state "$jobid" DONE
+  else
+    _cmux_v5_job_set_state "$jobid" FAILED
+  fi
+}
+
+# _cmux_v5_flow_render <flowid> <deps> <prompt>
+#   prompt 안의 {{ID.result}} 와 {{ID}} 토큰을 dep ID 의 result 로 치환(deps 만 대상).
+#   bash 파라미터 확장 ${//} 라 sed-style '&' 마법 없이 임의 바이트(& \ / " 등) 안전.
+#   치환된 prompt 를 stdout 으로 출력.
+_cmux_v5_flow_render() {
+  local flowid="$1" deps="$2" prompt="$3"
+  local d r
+  case "$deps" in ''|'-') printf '%s' "$prompt"; return 0 ;; esac
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    r="$(_cmux_v5_job_get_result "${flowid}__${d}")"
+    # .result 형식 먼저, 그 다음 bare {{ID}}. 패턴을 quote 하여 node id 를 literal 로 매칭.
+    prompt="${prompt//"{{${d}.result}}"/"$r"}"
+    prompt="${prompt//"{{${d}}}"/"$r"}"
+  done < <(_cmux_v5_flow_split_deps "$deps")
+  printf '%s' "$prompt"
+}
+
+# cmux_flow [file]
+#   stdin(또는 file 인자)에서 DAG DSL 을 읽어 파싱→사이클 검사→파도 스케줄링→최종 보고.
+#   최종 stdout: 노드당 한 줄 `id\tSTATE\t<result bytes>` (위상 정렬 순).
+#   rc 0 = 전 노드 DONE, rc 1 = FAILED/CANCELLED 하나라도 있음.
+cmux_flow() {
+  local src tmpd line id target deps prompt
+  local nodes_n=0 i j
+
+  # 0) 입력 소스 결정 (file 인자 우선, 없으면 stdin).
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    if [ ! -f "$1" ]; then
+      printf 'cmux_flow: no such file: %s\n' "$1" >&2
+      return 2
+    fi
+    src="$1"
+  else
+    src=""
+  fi
+
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/cmux-flow.XXXXXX")" || {
+    printf 'cmux_flow: mktemp failed\n' >&2; return 1
+  }
+
+  # 1) 파싱 — 노드를 인덱스별 temp 파일에 격리(zsh runtime 배열 함정 회피).
+  #    각 노드: $tmpd/<i>.id  .target  .deps  .prompt
+  #    중복 id 거부, id 문자셋 검증, deps='-' 정규화.
+  _cmux_v5_flow_parse() {
+    local _src="$1" _td="$2"
+    local _id _target _deps _prompt _n=0 _k _seen
+    while IFS="$(printf '\t')" read -r _id _target _deps _prompt || [ -n "$_id" ]; do
+      # 빈 줄/주석 스킵.
+      case "$_id" in ''|'#'*) continue ;; esac
+      # id 문자셋 검증.
+      case "$_id" in *[!A-Za-z0-9_-]*)
+        printf 'cmux_flow: invalid node id: %s\n' "$_id" >&2; return 2 ;;
+      esac
+      # 중복 id 검사.
+      _k=1
+      while [ "$_k" -le "$_n" ]; do
+        _seen="$(cat "$_td/$_k.id" 2>/dev/null)"
+        if [ "$_seen" = "$_id" ]; then
+          printf 'cmux_flow: duplicate node id: %s\n' "$_id" >&2; return 2
+        fi
+        _k=$((_k+1))
+      done
+      [ -z "$_deps" ] && _deps='-'
+      _n=$((_n+1))
+      printf '%s' "$_id"     > "$_td/$_n.id"
+      printf '%s' "$_target" > "$_td/$_n.target"
+      printf '%s' "$_deps"   > "$_td/$_n.deps"
+      printf '%s' "$_prompt" > "$_td/$_n.prompt"
+    done
+    printf '%s' "$_n" > "$_td/count"
+    return 0
+  }
+
+  if [ -n "$src" ]; then
+    _cmux_v5_flow_parse "$src" "$tmpd" < "$src" || { rm -rf "$tmpd"; return 2; }
+  else
+    _cmux_v5_flow_parse "" "$tmpd" || { rm -rf "$tmpd"; return 2; }
+  fi
+  nodes_n="$(cat "$tmpd/count" 2>/dev/null)"
+  case "$nodes_n" in ''|*[!0-9]*) nodes_n=0 ;; esac
+
+  if [ "$nodes_n" -eq 0 ]; then
+    rm -rf "$tmpd"
+    printf 'cmux_flow: no nodes parsed\n' >&2
+    return 2
+  fi
+  if [ "$nodes_n" -gt "$CMUX_V5_FLOW_MAX_NODES" ]; then
+    rm -rf "$tmpd"
+    printf 'cmux_flow: too many nodes (%d > MAX_NODES=%d)\n' "$nodes_n" "$CMUX_V5_FLOW_MAX_NODES" >&2
+    return 2
+  fi
+
+  # 2) dep 유효성 검사 — 모든 dep 이 알려진 node id 여야 한다.
+  local di dj dd one found
+  i=1
+  while [ "$i" -le "$nodes_n" ]; do
+    dd="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+    case "$dd" in '-'|'') i=$((i+1)); continue ;; esac
+    while IFS= read -r one; do
+      [ -z "$one" ] && continue
+      found=0
+      j=1
+      while [ "$j" -le "$nodes_n" ]; do
+        if [ "$(cat "$tmpd/$j.id" 2>/dev/null)" = "$one" ]; then found=1; break; fi
+        j=$((j+1))
+      done
+      if [ "$found" -eq 0 ]; then
+        printf 'cmux_flow: unknown dep "%s" referenced by node "%s"\n' "$one" "$(cat "$tmpd/$i.id" 2>/dev/null)" >&2
+        rm -rf "$tmpd"
+        return 2
+      fi
+    done < <(_cmux_v5_flow_split_deps "$dd")
+    i=$((i+1))
+  done
+
+  # 3) 위상 정렬(Kahn 동등) — 사이클 검사 + 출력 순서 결정 동시에.
+  #    placed[k]=1 표시 파일 + topo 순서 리스트($tmpd/topo, 노드 인덱스 한 줄씩).
+  : > "$tmpd/topo"
+  local placed_n=0 progress pk pdeps pd pall pidx
+  while [ "$placed_n" -lt "$nodes_n" ]; do
+    progress=0
+    i=1
+    while [ "$i" -le "$nodes_n" ]; do
+      if [ -f "$tmpd/$i.placed" ]; then i=$((i+1)); continue; fi
+      pdeps="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+      pall=1
+      case "$pdeps" in
+        '-'|'') : ;;
+        *)
+          while IFS= read -r pd; do
+            [ -z "$pd" ] && continue
+            # pd 의 노드 인덱스를 찾아 placed 여부 확인.
+            pidx=0
+            j=1
+            while [ "$j" -le "$nodes_n" ]; do
+              if [ "$(cat "$tmpd/$j.id" 2>/dev/null)" = "$pd" ]; then pidx="$j"; break; fi
+              j=$((j+1))
+            done
+            if [ "$pidx" -eq 0 ] || [ ! -f "$tmpd/$pidx.placed" ]; then pall=0; break; fi
+          done < <(_cmux_v5_flow_split_deps "$pdeps")
+          ;;
+      esac
+      if [ "$pall" -eq 1 ]; then
+        : > "$tmpd/$i.placed"
+        printf '%s\n' "$i" >> "$tmpd/topo"
+        placed_n=$((placed_n+1))
+        progress=1
+      fi
+      i=$((i+1))
+    done
+    if [ "$progress" -eq 0 ]; then
+      rm -rf "$tmpd"
+      printf 'cmux_flow: cycle detected\n' >&2
+      return 2
+    fi
+  done
+
+  # 4) flow id 할당 — epoch + $$ + 전역 카운터(같은 초/프로세스 충돌 방지). '__' 없는 single-underscore.
+  _CMUX_V5_FLOW_COUNTER=$(( ${_CMUX_V5_FLOW_COUNTER:-0} + 1 ))
+  local flowid
+  # tmpd 의 고유 suffix(mktemp 가 보장)를 flowid seed 로 재사용하면 서브셸 간 충돌 없음.
+  flowid="flow-$(basename "$tmpd")"
+
+  # 5) 노드별 job 등록 (state=PENDING). jobid = <flowid>__<nodeid>.
+  local nid ntarget ndeps njobid
+  i=1
+  while [ "$i" -le "$nodes_n" ]; do
+    nid="$(cat "$tmpd/$i.id" 2>/dev/null)"
+    ntarget="$(cat "$tmpd/$i.target" 2>/dev/null)"
+    ndeps="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+    njobid="${flowid}__${nid}"
+    if ! _cmux_v5_job_new "$njobid" "$ntarget" "$ndeps"; then
+      rm -rf "$tmpd"
+      printf 'cmux_flow: job registration failed for node %s\n' "$nid" >&2
+      return 1
+    fi
+    i=$((i+1))
+  done
+
+  # 6) 파도 루프 — PENDING 이 없어질 때까지.
+  #    각 패스: PENDING 노드를 스캔하여
+  #      - dep 중 FAILED/CANCELLED 있음 → CANCELLED 로 전파(newly_cancelled).
+  #      - 모든 dep DONE → ready (병렬 dispatch 대상).
+  #    ready 가 비고 PENDING 이 남았는데 newly_cancelled 도 없으면 deadlock 가드로 break.
+  local wave_ready newly_cancelled st depst rdy_i pending_left ready_cnt dep_failed dep_all_done
+  while :; do
+    # 아직 PENDING 인 노드가 있는지 + ready / cancel 분류.
+    pending_left=0
+    : > "$tmpd/ready"
+    newly_cancelled=0
+    i=1
+    while [ "$i" -le "$nodes_n" ]; do
+      njobid="${flowid}__$(cat "$tmpd/$i.id" 2>/dev/null)"
+      st="$(_cmux_v5_job_state "$njobid")"
+      if [ "$st" != "PENDING" ]; then i=$((i+1)); continue; fi
+      pending_left=1
+      ndeps="$(cat "$tmpd/$i.deps" 2>/dev/null)"
+      # dep 상태 평가.
+      dep_failed=0; dep_all_done=1
+      case "$ndeps" in
+        '-'|'') : ;;
+        *)
+          while IFS= read -r one; do
+            [ -z "$one" ] && continue
+            depst="$(_cmux_v5_job_state "${flowid}__${one}")"
+            case "$depst" in
+              FAILED|CANCELLED) dep_failed=1; dep_all_done=0 ;;
+              DONE) : ;;
+              *) dep_all_done=0 ;;
+            esac
+          done < <(_cmux_v5_flow_split_deps "$ndeps")
+          ;;
+      esac
+      if [ "$dep_failed" -eq 1 ]; then
+        _cmux_v5_job_set_state "$njobid" CANCELLED
+        newly_cancelled=1
+      elif [ "$dep_all_done" -eq 1 ]; then
+        printf '%s\n' "$i" >> "$tmpd/ready"
+      fi
+      i=$((i+1))
+    done
+
+    # PENDING 이 더 없으면 종료.
+    if [ "$pending_left" -eq 0 ]; then break; fi
+
+    # ready 개수 확인.
+    ready_cnt="$(wc -l < "$tmpd/ready" 2>/dev/null | tr -d ' ')"
+    case "$ready_cnt" in ''|*[!0-9]*) ready_cnt=0 ;; esac
+
+    if [ "$ready_cnt" -eq 0 ]; then
+      # ready 없음: 이번 패스에 cancel 이 있었으면 다음 패스로 cascade, 아니면 deadlock 가드.
+      if [ "$newly_cancelled" -eq 1 ]; then
+        continue
+      else
+        break
+      fi
+    fi
+
+    # ready 노드 전부 병렬 dispatch 후 wave 단위 wait.
+    while IFS= read -r rdy_i; do
+      [ -z "$rdy_i" ] && continue
+      nid="$(cat "$tmpd/$rdy_i.id" 2>/dev/null)"
+      ntarget="$(cat "$tmpd/$rdy_i.target" 2>/dev/null)"
+      ndeps="$(cat "$tmpd/$rdy_i.deps" 2>/dev/null)"
+      prompt="$(cat "$tmpd/$rdy_i.prompt" 2>/dev/null)"
+      # 부모에서 템플릿 렌더(이 시점 dep 결과는 디스크에 존재).
+      prompt="$(_cmux_v5_flow_render "$flowid" "$ndeps" "$prompt")"
+      ( _cmux_v5_flow_exec_node "$flowid" "$nid" "$ntarget" "$prompt" ) &
+    done < "$tmpd/ready"
+    wait
+  done
+
+  # 7) 최종 보고 — topo 순서대로 id\tSTATE\t<result>. rc 집계.
+  local rc_all=0 tline tnid tjobid tstate tresult
+  while IFS= read -r tline; do
+    [ -z "$tline" ] && continue
+    tnid="$(cat "$tmpd/$tline.id" 2>/dev/null)"
+    tjobid="${flowid}__${tnid}"
+    tstate="$(_cmux_v5_job_state "$tjobid")"
+    tresult="$(_cmux_v5_job_get_result "$tjobid")"
+    printf '%s\t%s\t%d\n' "$tnid" "$tstate" "${#tresult}"
+    [ "$tstate" = "DONE" ] || rc_all=1
+  done < "$tmpd/topo"
+
+  rm -rf "$tmpd"
+  return "$rc_all"
 }
