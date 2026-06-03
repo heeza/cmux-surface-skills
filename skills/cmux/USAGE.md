@@ -4,6 +4,15 @@
 
 기본 개념은 [`SKILL.md`](SKILL.md) 참조. 이 문서는 **어떤 패턴을 언제 쓰는지** 와 **실제 호출 예제** 에 집중.
 
+자주 쓰는 짧은 alias:
+
+| alias | 원 함수 |
+|---|---|
+| `cmuxa` | `cmux_ask` |
+| `cmuxs` | `cmux_send` |
+| `cmuxg` | `cmux_collect` |
+| `cmuxc` | `cmux_cross` |
+
 ---
 
 ## 1. 두 패턴 한눈에

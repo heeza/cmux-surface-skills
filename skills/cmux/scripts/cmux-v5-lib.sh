@@ -8,7 +8,9 @@
 #  - cmux_ask 는 기본 안전, cmux_ask_unsafe 는 명시적 escape valve.
 #
 # Public:  cmux_ask  cmux_ask_unsafe  cmux_send  cmux_collect
+#          cmuxa     cmuxs            cmuxg
 #          cmux_check  cmux_tail  cmux_cancel
+#          cmux_cross  cmuxc
 #          cmux_by_title (alias)  cmux_other_surfaces
 #
 # v5.1 — cmux_ask / cmux_ask_unsafe / cmux_send / cmux_cancel 의 surface 인자는
@@ -1171,6 +1173,11 @@ cmux_ask() {
   _cmux_v5_dispatch "$surface" "$prompt" "$mode" "$timeout" "$CMUX_V5_RESPONSE_MAX"
 }
 
+# Short interactive alias for cmux_ask.
+cmuxa() {
+  cmux_ask "$@"
+}
+
 # cmux_ask_unsafe — cap 우회. 큰 응답이 의도적임을 호출자가 선언.
 # cmux_ask_unsafe <surface> <prompt> [--mode ...] [--timeout N]
 #                [--prompt-max N] [--response-max N]
@@ -1266,6 +1273,11 @@ cmux_send() {
     return $?
   fi
   printf '%s' "$job"
+}
+
+# Short interactive alias for cmux_send.
+cmuxs() {
+  cmux_send "$@"
 }
 
 # 단일 FIFO 회수 (내부). stale = surface 사라짐 → unlink + rc 0 (스킵, 본문 없음).
@@ -1520,6 +1532,11 @@ cmux_collect() {
     return 6
   }
   _cmux_v5_collect_one "$fifo" "$timeout" "$rmax"
+}
+
+# Short interactive alias for cmux_collect.
+cmuxg() {
+  cmux_collect "$@"
 }
 
 # cmux_watch <job> [--timeout N] [--interval N] [--response-max N]
@@ -2019,6 +2036,11 @@ $transcript_context
     printf '[cmux v5] Synthesizing final summary via %s...\n' "$analyzer" >&2
   fi
   cmux_ask_unsafe "$analyzer" "$final_prompt" --prompt-max "$cross_pmax" --response-max "$cross_rmax" --timeout "$timeout"
+}
+
+# Short interactive alias for cmux_cross.
+cmuxc() {
+  cmux_cross "$@"
 }
 
 # cmux_broadcast <prompt> [target ...] [--mode m] [--timeout N] [--response-max N]

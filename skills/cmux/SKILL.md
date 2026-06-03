@@ -42,10 +42,12 @@ ANSWER=$(cmux_ask_unsafe "codex" "$LONG" --prompt-max 4000 --response-max 65536 
 
 ```bash
 cmux_send "codex" "build 끝나면 한 줄 요약"
+cmuxs "codex" "build 끝나면 한 줄 요약"   # 짧은 alias
 
 # 진짜 비동기로 분리하고 싶으면
 job=$(cmux_send "codex" "build 끝나면 한 줄 요약" --no-watch)
 cmux_collect "$job" --timeout 600
+cmuxg "$job" --timeout 600
 ```
 
 여러 에이전트에 동시 질의 (fan-out → 병렬 fan-in):
@@ -68,14 +70,18 @@ cmux_other_surfaces
 | 함수 | 용도 |
 |---|---|
 | `cmux_ask <surface|title> <prompt> [--mode llm|worker] [--timeout N]` | 동기 요청. 기본 cap 적용 |
+| `cmuxa <surface|title> <prompt> ...` | `cmux_ask` 짧은 alias |
 | `cmux_ask_unsafe <surface|title> <prompt> [opts]` | 큰 prompt/response 의도 시 사용 |
 | `cmux_send <surface|title> <prompt> [--mode llm|worker] [--timeout N]` | 송신 후 기본 watch. stdout은 최종 응답 |
+| `cmuxs <surface|title> <prompt> ...` | `cmux_send` 짧은 alias |
 | `cmux_collect [job|surface|title] [--timeout N] [--response-max N]` | pending job 결과 수집 |
+| `cmuxg [job|surface|title] ...` | `cmux_collect` 짧은 alias |
 | `cmux_watch <job> [--timeout N] [--interval N] [--response-max N]` | short collect loop로 job 완료까지 자동 대기 |
 | `cmux_tail <job> [--timeout N]` | FIFO raw tail |
 | `cmux_cancel <job> [--esc]` | FIFO 삭제, optional ESC |
 | `cmux_check [job|surface|title]` | 가벼운 pending 확인. 결과 polling에는 `cmux_collect --timeout <짧게>` 권장 |
 | `cmux_cross <target> [analyzer] <prompt> [--rounds N] [--timeout N]` | 교차 검토 및 피드백 토론 오케스트레이션 (3회 반복, hop당 30분 디폴트). 응답은 `CMUX_V5_CROSS_RESPONSE_MAX`로 캡 |
+| `cmuxc <target> [analyzer] <prompt> ...` | `cmux_cross` 짧은 alias |
 | `cmux_broadcast <prompt> [target ...] [--mode m] [--timeout N] [--response-max N]` | 동일 prompt 를 여러 LLM surface 에 fan-out 후 병렬 fan-in. 대상 생략 시 같은 workspace 의 다른 LLM 전체. 1-shot·응답 캡으로 토큰 bound |
 
 target 인자는 현재 workspace 안의 pane name, surface title, 또는 `surface:N`을 받는다. `surface:N`도 현재 workspace 안에 있을 때만 허용된다. title/name 다중 매치 시 현재 workspace 안의 첫 번째를 쓴다.

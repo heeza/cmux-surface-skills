@@ -22,6 +22,13 @@ ANSWER=$(cmux_ask shell "git log -5 --oneline" --mode worker)
 - `cmux_cancel` — FIFO 정리 + optional ESC
 - `cmux_other_surfaces` — 같은 workspace 의 다른 surface 탐색
 
+짧은 인터랙티브 alias:
+
+- `cmuxa` → `cmux_ask`
+- `cmuxs` → `cmux_send`
+- `cmuxg` → `cmux_collect`
+- `cmuxc` → `cmux_cross`
+
 운영 동작:
 
 - 모든 target resolve는 현재 workspace 안으로 제한된다. pane name 또는 surface title을 우선 사용하고, `surface:N`도 같은 workspace에 있을 때만 허용된다.

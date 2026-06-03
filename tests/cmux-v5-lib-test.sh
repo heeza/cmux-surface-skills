@@ -328,6 +328,41 @@ test_cmux_send_no_watch_returns_job_id() {
   pass "cmux_send --no-watch returns job id"
 }
 
+test_short_aliases_delegate_hot_path() {
+  local out fifo ans
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 [focused] ◀ active
+    │   └── surface surface:1 [terminal] "codex" [selected] ◀ active ◀ here tty=ttys001
+    └── pane pane:2 "reviewer"
+        └── surface surface:9 [terminal] "claudee" [selected] tty=ttys002'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+
+  export CMUX_TEST_SEND_WRITE='ask-alias'
+  export CMUX_TEST_SEND_DELAY=0
+  out="$(cmuxa "surface:9" "ping" --mode llm --timeout 3 2>/dev/null)"
+  [ "$out" = "ask-alias" ] || fail "cmuxa output was '$out'"
+
+  export CMUX_TEST_SEND_WRITE='send-alias'
+  out="$(cmuxs "surface:9" "ping" --mode llm --timeout 3 --watch-interval 1 2>/dev/null)"
+  [ "$out" = "send-alias" ] || fail "cmuxs output was '$out'"
+
+  unset CMUX_TEST_SEND_WRITE
+  unset CMUX_TEST_SEND_DELAY
+  fifo="$(make_fifo "job-alias")"
+  ans="${fifo%.res}.ans"
+  (
+    printf 'collect-alias' > "$ans.tmp"
+    mv -f "$ans.tmp" "$ans"
+  ) &
+  out="$(cmuxg "job-alias" --timeout 3 2>/dev/null)"
+  wait 2>/dev/null || true
+  [ "$out" = "collect-alias" ] || fail "cmuxg output was '$out'"
+
+  pass "short aliases cmuxa/cmuxs/cmuxg delegate"
+}
+
 test_cmux_cross_carries_objective_and_transcript() {
   local call_dir out
   call_dir="$TMP_ROOT/cross-calls"
@@ -351,7 +386,7 @@ test_cmux_cross_carries_objective_and_transcript() {
     printf 'answer-%s' "$n"
   }
 
-  out="$(cmux_cross "target" "analyzer" "설계 목표를 고도화" --rounds 1 2>/dev/null)"
+  out="$(cmuxc "target" "analyzer" "설계 목표를 고도화" --rounds 1 2>/dev/null)"
 
   [ "$out" = "answer-4" ] || fail "cmux_cross final output was '$out'"
   grep -q '설계 목표를 고도화' "$call_dir/2.prompt" || fail "feedback prompt missed original objective"
@@ -362,7 +397,7 @@ test_cmux_cross_carries_objective_and_transcript() {
   grep -q 'Round 1 Analyzer/Critic Feedback' "$call_dir/4.prompt" || fail "final prompt missed analyzer feedback transcript"
   grep -q 'Round 1 Target/Designer Response' "$call_dir/4.prompt" || fail "final prompt missed target response transcript"
   grep -q '라운드별 검토자 피드백' "$call_dir/4.prompt" || fail "final prompt does not require debate summary"
-  pass "cmux_cross carries objective and transcript through debate"
+  pass "cmuxc delegates to cmux_cross and carries objective/transcript"
 }
 
 test_cmux_cross_two_arg_defaults() {
@@ -415,5 +450,6 @@ test_collect_rejects_job_outside_current_workspace
 test_cmux_watch_collects_without_manual_input
 test_cmux_send_returns_result_by_default
 test_cmux_send_no_watch_returns_job_id
+test_short_aliases_delegate_hot_path
 test_cmux_cross_carries_objective_and_transcript
 test_cmux_cross_two_arg_defaults
