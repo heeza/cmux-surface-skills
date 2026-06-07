@@ -45,6 +45,10 @@ chmod +x "$STUB_DIR/cmux"
 
 export PATH="$STUB_DIR:$PATH"
 export CMUX_V5_FIFO_DIR="$TMP_ROOT/fifo"
+export CMUX_V5_LOCK_DIR="$TMP_ROOT/locks"
+export CMUX_V5_JOB_DIR="$TMP_ROOT/jobs"
+export CMUX_V5_LOCK_WAIT=10
+export CMUX_V5_LOCK_TTL=30
 export CMUX_V5_QUIET=on
 export CMUX_V5_TREE_TTL=0
 export CMUX_V5_FALLBACK_SCREEN=off
@@ -68,6 +72,12 @@ make_fifo() {
   rm -f "$fifo"
   mkfifo "$fifo"
   printf '%s' "$fifo"
+}
+
+reset_job_state() {
+  rm -rf "$CMUX_V5_JOB_DIR" "$CMUX_V5_LOCK_DIR"
+  mkdir -p "$CMUX_V5_JOB_DIR" "$CMUX_V5_LOCK_DIR"
+  _CMUX_V5_JOBGC_DONE=0
 }
 
 test_collect_timeout_preserves_fifo() {
@@ -503,6 +513,217 @@ test_resolve_trace_on_logs_match_key() {
   pass "trace=on shows matching key on stderr"
 }
 
+test_job_registry_lock_serializes_attempts() {
+  local i attempts
+  reset_job_state
+
+  _cmux_v5_job_new "lock-job" "surface:1" || fail "job registry did not create lock-job"
+
+  i=0
+  while [ "$i" -lt 12 ]; do
+    i=$((i + 1))
+    (_cmux_v5_job_incr_attempts "lock-job" >/dev/null) &
+  done
+  wait
+
+  attempts="$(_cmux_v5_job_get "lock-job" attempts)"
+  [ "$attempts" = "12" ] || fail "concurrent attempts count was '$attempts', expected 12"
+  pass "job registry lock serializes concurrent metadata updates"
+}
+
+test_lock_breaks_dead_pid_stale_lock() {
+  local lockpath pid
+  reset_job_state
+
+  lockpath="$(_cmux_v5_lock_path "stale-job")"
+  mkdir -p "$lockpath"
+  printf '999999999' > "$lockpath/pid"
+  date +%s > "$lockpath/ts"
+
+  _cmux_v5_lock "stale-job" 1 || fail "lock did not break dead-pid stale lock"
+  pid="$(cat "$lockpath/pid" 2>/dev/null)"
+  [ "$pid" = "$$" ] || fail "stale lock pid was not replaced: '$pid'"
+  _cmux_v5_unlock "stale-job"
+  pass "lock breaks stale lock when owner pid is dead"
+}
+
+test_cmux_flow_happy_path_and_template_rendering() {
+  local flow_file out log_dir
+  reset_job_state
+  log_dir="$TMP_ROOT/flow-happy-log"
+  mkdir -p "$log_dir"
+  FLOW_TEST_LOG_DIR="$log_dir"
+
+  # shellcheck disable=SC2329
+  _cmux_v5_flow_run_node() {
+    local target="$1" prompt="$2" safe
+    safe="$(printf '%s' "$target" | tr ':/ ' '___')"
+    printf '%s' "$prompt" > "$FLOW_TEST_LOG_DIR/$safe.prompt"
+    printf 'result:%s:%s' "$target" "$prompt"
+  }
+
+  flow_file="$TMP_ROOT/flow-happy.tsv"
+  {
+    printf 'a\tsurface:1\t-\talpha\n'
+    printf 'b\tsurface:2\ta\tbeta {{a.result}}\n'
+  } > "$flow_file"
+
+  out="$(cmux_flow "$flow_file" 2>"$TMP_ROOT/flow-happy.err")" || fail "cmux_flow happy path failed"
+
+  printf '%s\n' "$out" | grep -q "$(printf 'a\tDONE\t')" || fail "flow output missed DONE for a: $out"
+  printf '%s\n' "$out" | grep -q "$(printf 'b\tDONE\t')" || fail "flow output missed DONE for b: $out"
+  grep -q 'result:surface:1:alpha' "$log_dir/surface_2.prompt" || fail "flow did not render dependency result into b prompt"
+  pass "cmux_flow runs DAG nodes and renders dependency result templates"
+}
+
+test_cmux_flow_failure_cascades_but_independent_branch_continues() {
+  local flow_file out rc
+  reset_job_state
+
+  # shellcheck disable=SC2329
+  _cmux_v5_flow_run_node() {
+    local target="$1" prompt="$2"
+    case "$prompt" in
+      *fail*) return 9 ;;
+    esac
+    printf 'ok:%s:%s' "$target" "$prompt"
+  }
+
+  flow_file="$TMP_ROOT/flow-failure.tsv"
+  {
+    printf 'root\tsurface:1\t-\tfail root\n'
+    printf 'child\tsurface:2\troot\tuses {{root.result}}\n'
+    printf 'independent\tsurface:3\t-\tstill runs\n'
+  } > "$flow_file"
+
+  set +e
+  out="$(cmux_flow "$flow_file" 2>"$TMP_ROOT/flow-failure.err")"
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 1 ] || fail "flow failure rc=$rc, expected 1"
+  printf '%s\n' "$out" | grep -q "$(printf 'root\tFAILED\t')" || fail "root should be FAILED: $out"
+  printf '%s\n' "$out" | grep -q "$(printf 'child\tCANCELLED\t')" || fail "child should be CANCELLED: $out"
+  printf '%s\n' "$out" | grep -q "$(printf 'independent\tDONE\t')" || fail "independent branch should continue: $out"
+  pass "cmux_flow cascades failed dependencies while independent branch continues"
+}
+
+test_cmux_flow_rejects_unknown_deps_and_cycles() {
+  local flow_file rc err
+  reset_job_state
+
+  flow_file="$TMP_ROOT/flow-unknown.tsv"
+  printf 'a\tsurface:1\tmissing\twill not run\n' > "$flow_file"
+  set +e
+  cmux_flow "$flow_file" >/dev/null 2>"$TMP_ROOT/flow-unknown.err"
+  rc=$?
+  set -e
+  err="$(cat "$TMP_ROOT/flow-unknown.err")"
+  [ "$rc" -eq 2 ] || fail "unknown dep rc=$rc, expected 2"
+  printf '%s\n' "$err" | grep -q 'unknown dep "missing"' || fail "unknown dep error was not explicit: $err"
+
+  reset_job_state
+  flow_file="$TMP_ROOT/flow-cycle.tsv"
+  {
+    printf 'a\tsurface:1\tb\tcycle a\n'
+    printf 'b\tsurface:2\ta\tcycle b\n'
+  } > "$flow_file"
+  set +e
+  cmux_flow "$flow_file" >/dev/null 2>"$TMP_ROOT/flow-cycle.err"
+  rc=$?
+  set -e
+  err="$(cat "$TMP_ROOT/flow-cycle.err")"
+  [ "$rc" -eq 2 ] || fail "cycle rc=$rc, expected 2"
+  printf '%s\n' "$err" | grep -q 'cycle detected' || fail "cycle error was not explicit: $err"
+  pass "cmux_flow rejects unknown dependencies and cycles"
+}
+
+test_cmux_flow_cap_routing_spreads_ready_wave() {
+  local flow_file out targets unique_count
+  reset_job_state
+  FLOW_TEST_LOG_DIR="$TMP_ROOT/flow-route-log"
+  mkdir -p "$FLOW_TEST_LOG_DIR"
+
+  # shellcheck disable=SC2329
+  _cmux_v5_resolve() {
+    printf '%s' "$1"
+  }
+
+  # shellcheck disable=SC2329
+  cmux_other_surfaces() {
+    printf 'surface:1\nsurface:2\n'
+  }
+
+  # shellcheck disable=SC2329
+  _cmux_v5_surface_title() {
+    case "$1" in
+      surface:1) printf 'codex-a' ;;
+      surface:2) printf 'codex-b' ;;
+    esac
+  }
+
+  # shellcheck disable=SC2329
+  _cmux_v5_detect() {
+    printf 'llm'
+  }
+
+  # shellcheck disable=SC2329
+  _cmux_v5_flow_run_node() {
+    printf '%s\n' "$1" >> "$FLOW_TEST_LOG_DIR/targets"
+    sleep 1
+    printf 'routed:%s' "$1"
+  }
+
+  flow_file="$TMP_ROOT/flow-route.tsv"
+  {
+    printf 'r1\t@codex\t-\troute one\n'
+    printf 'r2\t@codex\t-\troute two\n'
+  } > "$flow_file"
+
+  out="$(cmux_flow "$flow_file" 2>"$TMP_ROOT/flow-route.err")" || fail "routed cmux_flow failed: $out"
+  targets="$(cat "$FLOW_TEST_LOG_DIR/targets" 2>/dev/null)"
+  unique_count="$(printf '%s\n' "$targets" | sort -u | wc -l | tr -d ' ')"
+  [ "$unique_count" = "2" ] || fail "route lock did not spread wave across surfaces: $targets"
+  printf '%s\n' "$targets" | grep -q '^surface:1$' || fail "route did not use surface:1: $targets"
+  printf '%s\n' "$targets" | grep -q '^surface:2$' || fail "route did not use surface:2: $targets"
+  pass "cmux_flow @cap routing spreads concurrent ready nodes"
+}
+
+test_trace_and_metrics_report_job_registry_state() {
+  local trace metrics
+  reset_job_state
+
+  # shellcheck disable=SC2329
+  _cmux_v5_resolve() {
+    printf '%s' "$1"
+  }
+
+  _cmux_v5_job_new "obs-flow__a" "surface:1" || fail "could not create obs a"
+  _cmux_v5_job_set_state "obs-flow__a" DISPATCHING
+  _cmux_v5_job_set_result "obs-flow__a" "done-a"
+  _cmux_v5_job_set_state "obs-flow__a" DONE
+
+  _cmux_v5_job_new "obs-flow__b" "surface:1" || fail "could not create obs b"
+  _cmux_v5_job_set_state "obs-flow__b" DISPATCHING
+  _cmux_v5_job_set_state "obs-flow__b" FAILED
+
+  _cmux_v5_job_new "obs-flow__c" "surface:2" || fail "could not create obs c"
+  _cmux_v5_job_set_state "obs-flow__c" CANCELLED
+
+  trace="$(cmux_trace "obs-flow" 2>"$TMP_ROOT/trace.err")" || fail "cmux_trace failed"
+  printf '%s\n' "$trace" | grep -q '^NODE' || fail "trace missed table header: $trace"
+  printf '%s\n' "$trace" | grep -q '^a[[:space:]]*DONE' || fail "trace missed DONE node a: $trace"
+  printf '%s\n' "$trace" | grep -q '^b[[:space:]]*FAILED' || fail "trace missed FAILED node b: $trace"
+  printf '%s\n' "$trace" | grep -q '^GANTT' || fail "trace missed gantt output: $trace"
+
+  metrics="$(cmux_metrics 2>"$TMP_ROOT/metrics.err")" || fail "cmux_metrics failed"
+  printf '%s\n' "$metrics" | awk '$1=="surface:1" && $2=="2" && $3=="1" && $4=="1" && $5=="0" && $6=="50" { ok=1 } END { exit ok ? 0 : 1 }' \
+    || fail "metrics did not aggregate surface:1 correctly: $metrics"
+  printf '%s\n' "$metrics" | awk '$1=="surface:2" && $2=="1" && $3=="0" && $4=="0" && $5=="1" && $6=="-" { ok=1 } END { exit ok ? 0 : 1 }' \
+    || fail "metrics did not aggregate surface:2 cancellation correctly: $metrics"
+  pass "cmux_trace and cmux_metrics report job registry state"
+}
+
 test_collect_timeout_preserves_fifo
 test_collect_success_unlinks_fifo
 test_truncation_metadata_is_out_of_band
@@ -522,3 +743,10 @@ test_resolve_trace_off_emits_no_decision_log
 test_resolve_trace_on_logs_match_key
 test_cmux_cross_carries_objective_and_transcript
 test_cmux_cross_two_arg_defaults
+test_job_registry_lock_serializes_attempts
+test_lock_breaks_dead_pid_stale_lock
+test_cmux_flow_happy_path_and_template_rendering
+test_cmux_flow_failure_cascades_but_independent_branch_continues
+test_cmux_flow_rejects_unknown_deps_and_cycles
+test_cmux_flow_cap_routing_spreads_ready_wave
+test_trace_and_metrics_report_job_registry_state

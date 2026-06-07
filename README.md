@@ -118,12 +118,34 @@ Gemini CLI 는 별도 스킬 시스템이 없어 자동 노출 안 됨. 필요�
 - shellcheck — CI/static check 용도
 - 그 외 스킬은 대부분 self-contained
 
+## 품질 게이트
+
+로컬에서는 한 명령으로 syntax, zsh source smoke, ShellCheck(설치된 경우), 기능 테스트를 실행한다.
+
+```bash
+make check
+```
+
+세부 진입점:
+
+- `scripts/doctor` — 필수/선택 도구 존재 확인
+- `scripts/check` — `bash -n`, `zsh -n`, zsh source smoke, ShellCheck, `tests/cmux-v5-lib-test.sh`
+- `make test` — Bash 기능 테스트만 빠르게 실행
+
+CI는 Ubuntu와 macOS 양쪽에서 `scripts/check`를 실행해 GNU/BSD 유틸리티 차이와 zsh sourcing 회귀를 함께 잡는다. 현재 기능 테스트는 FIFO collect/send, resolve, `cmux_cross`, job registry/lock, `cmux_flow`, `cmux_trace`, `cmux_metrics` 계약을 포함한다.
+
 ## 레이아웃
 
 ```
 ~/.agents/
+├── Makefile
 ├── rules/
 │   └── antigravity-rtk-rules.md
+├── scripts/
+│   ├── check
+│   └── doctor
+├── tests/
+│   └── cmux-v5-lib-test.sh
 └── skills/
     ├── cmux/
     │   ├── SKILL.md

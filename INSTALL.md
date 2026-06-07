@@ -115,21 +115,33 @@ printf '@%s/.agents/skills/diagnose/SKILL.md\n' "$HOME" >> ~/.codex/AGENTS.md
 
 ## 3. v5 lib 작동 검증
 
+저장소 clone 직후에는 먼저 전체 로컬 게이트를 실행합니다.
+
+```bash
+cd ~/.agents
+make check
+```
+
+`make check`는 `scripts/doctor`, Bash/zsh syntax, zsh source smoke, ShellCheck(설치된 경우), `tests/cmux-v5-lib-test.sh`를 순서대로 실행합니다.
+
 ```bash
 bash -c '
   source ~/.agents/skills/cmux/scripts/cmux-v5-lib.sh
 
   echo "=== 1) public 함수 확인 ==="
-  declare -F | grep -E "cmux_(ask|other)"
-  # 다음 3개 보여야 함:
+  declare -F | grep -E "cmux_(ask|flow|trace|metrics|other)"
+  # 적어도 다음 함수들이 보여야 함:
   #   cmux_ask
   #   cmux_ask_unsafe
+  #   cmux_flow
+  #   cmux_trace
+  #   cmux_metrics
   #   cmux_other_surfaces
 
   echo "=== 2) cap 기본값 확인 ==="
   echo "PROMPT_MAX=$CMUX_V5_PROMPT_MAX (기본 500)"
   echo "RESPONSE_MAX=$CMUX_V5_RESPONSE_MAX (기본 4096)"
-  echo "TIMEOUT=$CMUX_V5_TIMEOUT (기본 30)"
+  echo "TIMEOUT=$CMUX_V5_TIMEOUT (기본 1200)"
 
   echo "=== 3) cap 강제 reject 확인 ==="
   long=$(printf "a%.0s" $(seq 1 600))
@@ -138,7 +150,7 @@ bash -c '
 '
 ```
 
-기대 결과: 함수 3개 보임 + cap 값 출력 + reject 시 exit 2.
+기대 결과: 핵심 public 함수들이 보임 + cap 값 출력 + reject 시 exit 2.
 
 ---
 

@@ -102,7 +102,8 @@ YAML
 
 전 단계 구현 완료. 모든 변경은 **추가형**이며 기존 public 함수
 (`cmux_ask`/`send`/`collect`/`check`/`cross`/`broadcast`)와 FIFO 동작은 불변.
-bash·zsh 양쪽에서 `-n` 및 기능 테스트 통과.
+bash·zsh 양쪽에서 `-n` 및 기능 테스트 통과. 로컬/CI 공통 진입점은
+`make check` → `scripts/check` 이며, CI는 Ubuntu와 macOS 양쪽에서 실행한다.
 
 | 단계 | 상태 | 핵심 산출물 |
 |---|---|---|
@@ -116,8 +117,14 @@ bash·zsh 양쪽에서 `-n` 및 기능 테스트 통과.
 ### 신규 public 함수
 `cmux_flow`, `cmux_trace`, `cmux_metrics`. (그 외는 모두 `_cmux_v5_*` private.)
 
+### 검증 범위
+- 기존 hot path: FIFO collect/send/watch, truncation metadata, worker focus guard, workspace-scoped resolve, duplicate-title trace, `cmux_cross` transcript/arg parsing.
+- P0/P1: portable lock stale recovery, concurrent job metadata update serialization, job registry state/result/event files.
+- P2/P3: `cmux_flow` happy path, dependency template rendering, failed-dependency cancellation cascade, independent branch continuation, unknown dep/cycle rejection, `@cap` wave routing spread.
+- P4: synthetic job registry fixtures over `cmux_trace` and `cmux_metrics` aggregation.
+
 ### 알려진 한계 / 후속 과제
 - **percentile 정밀도**: 정수 초 단위 exec 시간 기반. 더 세밀하면 `events.ndjson` 에 ms 도입 필요(현재 `date +%s`, `%N` 회피).
 - **선재 이슈**: 기존 `_cmux_v5_job` 의 `date +%s%N` 는 macOS 에서 `%N` 미지원(리터럴 `N`). 이번 범위 밖, 별도 추적.
-- **cmux_flow ↔ 라이브 surface**: 테스트는 `_cmux_v5_flow_run_node` 스텁으로 DAG/라우팅/관측 로직만 검증. 실제 surface 연동 E2E 는 별도.
+- **cmux_flow ↔ 라이브 surface**: 자동 테스트는 `_cmux_v5_flow_run_node` 스텁으로 DAG/라우팅/관측 로직을 검증한다. 실제 LLM surface 연동 E2E 는 cmux 런타임과 sidecar 권한이 필요하므로 별도 수동/통합 검증 대상이다.
 - **template 교차 주입**: dep result 가 다른 dep 의 `{{id}}` 토큰을 문자 그대로 포함하면 순차 치환 중 재주입 가능(실사용 드묾, 문서화된 한계).

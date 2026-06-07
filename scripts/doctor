@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+missing=0
+
+require_cmd() {
+  if command -v "$1" >/dev/null 2>&1; then
+    printf 'ok - %s\n' "$1"
+  else
+    printf 'not ok - missing required command: %s\n' "$1" >&2
+    missing=1
+  fi
+}
+
+optional_cmd() {
+  if command -v "$1" >/dev/null 2>&1; then
+    printf 'ok - %s\n' "$1"
+  else
+    printf 'warn - missing optional command: %s\n' "$1" >&2
+  fi
+}
+
+require_cmd bash
+require_cmd perl
+require_cmd awk
+require_cmd ps
+require_cmd mkfifo
+require_cmd git
+
+optional_cmd zsh
+optional_cmd shellcheck
+optional_cmd cmux
+
+if [ "$missing" -ne 0 ]; then
+  exit 1
+fi

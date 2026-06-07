@@ -268,6 +268,16 @@ _cmux_v5_init_dir() {
 # _cmux_v5_lock_path <name> -> 락 디렉터리 경로
 _cmux_v5_lock_path() { printf '%s/%s.lock' "$CMUX_V5_LOCK_DIR" "$1"; }
 
+_cmux_v5_lock_owner_var() {
+  local safe
+  safe="$(printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_')"
+  printf '_CMUX_V5_LOCK_OWNER_%s' "$safe"
+}
+
+_cmux_v5_lock_current_pid() {
+  printf '%s' "${BASHPID:-$$}"
+}
+
 # _cmux_v5_lock_is_stale <lockpath> -> stale 이면 0, 아니면 1.
 #   판정: 소유 PID 명시적 사망 OR (now - ts > TTL).
 #   ts 파일을 직접 읽어 비교하므로 stat 의 BSD/GNU 차이를 회피.
@@ -303,26 +313,33 @@ _cmux_v5_lock_is_stale() {
 #   획득 시 pid/ts 메타를 락 디렉터리 안에 기록.
 _cmux_v5_lock() {
   local name="$1" wait_secs="${2:-${CMUX_V5_LOCK_WAIT:-10}}"
-  local lockpath now deadline
+  local lockpath now deadline owner_var owner_token owner_pid
   # 빈/슬래시 포함 name 은 락 디렉터리 밖 경로를 유발하므로 거부
   case "$name" in ''|*/*) return 1 ;; esac
   lockpath="$(_cmux_v5_lock_path "$name")"
+  owner_var="$(_cmux_v5_lock_owner_var "$name")"
+  owner_pid="$(_cmux_v5_lock_current_pid)"
+  owner_token="${owner_pid}:$$:${RANDOM:-0}:$(date +%s):$name"
   # 락 루트 디렉터리 lazy init
   mkdir -p "$CMUX_V5_LOCK_DIR" 2>/dev/null && chmod 700 "$CMUX_V5_LOCK_DIR" 2>/dev/null
   deadline=$(( $(date +%s) + wait_secs ))
   while :; do
     # 핵심 mutex: 기존 디렉터리면 mkdir 가 원자적으로 실패.
     if mkdir "$lockpath" 2>/dev/null; then
-      printf '%s' "$$" > "$lockpath/pid" 2>/dev/null
+      printf '%s' "$owner_pid" > "$lockpath/pid" 2>/dev/null
+      printf '%s' "$owner_token" > "$lockpath/owner" 2>/dev/null
       date +%s > "$lockpath/ts" 2>/dev/null
+      eval "$owner_var=\$owner_token"
       return 0
     fi
     # 점유 중 — stale 이면 break 후 1회 재시도.
     if _cmux_v5_lock_is_stale "$lockpath"; then
       rm -rf "$lockpath" 2>/dev/null
       if mkdir "$lockpath" 2>/dev/null; then
-        printf '%s' "$$" > "$lockpath/pid" 2>/dev/null
+        printf '%s' "$owner_pid" > "$lockpath/pid" 2>/dev/null
+        printf '%s' "$owner_token" > "$lockpath/owner" 2>/dev/null
         date +%s > "$lockpath/ts" 2>/dev/null
+        eval "$owner_var=\$owner_token"
         return 0
       fi
     fi
@@ -336,12 +353,15 @@ _cmux_v5_lock() {
 # _cmux_v5_unlock <name>
 #   소유 PID($$) 일치할 때만 제거(타 프로세스 락 오삭제 방지). 항상 0 반환.
 _cmux_v5_unlock() {
-  local name="$1" lockpath pid
+  local name="$1" lockpath owner_var owner_token lock_owner
   case "$name" in ''|*/*) return 0 ;; esac
   lockpath="$(_cmux_v5_lock_path "$name")"
-  pid="$(cat "$lockpath/pid" 2>/dev/null)"
-  if [ "$pid" = "$$" ]; then
+  owner_var="$(_cmux_v5_lock_owner_var "$name")"
+  eval "owner_token=\${$owner_var:-}"
+  lock_owner="$(cat "$lockpath/owner" 2>/dev/null)"
+  if [ -n "$owner_token" ] && [ "$lock_owner" = "$owner_token" ]; then
     rm -rf "$lockpath" 2>/dev/null
+    eval "unset $owner_var"
   fi
   return 0
 }

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+./scripts/doctor
+
+bash -n skills/cmux/scripts/cmux-v5-lib.sh
+bash -n tests/cmux-v5-lib-test.sh
+
+if command -v zsh >/dev/null 2>&1; then
+  zsh -n skills/cmux/scripts/cmux-v5-lib.sh
+  zsh -f -c 'source ./skills/cmux/scripts/cmux-v5-lib.sh; whence -w cmux_flow >/dev/null; whence -w cmux_trace >/dev/null; whence -w cmux_metrics >/dev/null'
+else
+  printf 'warn - zsh not found; skipping zsh syntax/source smoke\n' >&2
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck skills/cmux/scripts/cmux-v5-lib.sh tests/cmux-v5-lib-test.sh scripts/check scripts/doctor
+else
+  printf 'warn - shellcheck not found; skipping static analysis\n' >&2
+fi
+
+bash tests/cmux-v5-lib-test.sh
