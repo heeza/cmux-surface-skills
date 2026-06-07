@@ -45,6 +45,7 @@
 : "${CMUX_V5_WORKER_FOCUS_GUARD:=on}" # on|off — focused/current worker surface 보호
 : "${CMUX_V5_CROSS_TIMEOUT:=1800}"    # cmux_cross per-hop timeout seconds
 : "${CMUX_V5_CROSS_TRANSCRIPT_MAX:=32768}" # cmux_cross 라운드 transcript prompt 삽입 cap(bytes)
+: "${CMUX_V5_RESOLVE_TRACE:=off}"    # on|off — title/pane 매칭 결정 + 다중매치 후보를 stderr 로 노출
 
 # ---- private ----
 
@@ -138,6 +139,7 @@ _cmux_v5_resolve_in_current_workspace() {
         }
         !in_ws { next }
         match($0, /pane:[0-9]+/) {
+          pane_title = ""
           t = title($0)
           if (t != "") pane_title = t
           next
@@ -145,19 +147,19 @@ _cmux_v5_resolve_in_current_workspace() {
         match($0, /surface:[0-9]+/) {
           s = substr($0, RSTART, RLENGTH)
           t = title($0)
-          if (q == s || q == t || q == pane_title) {
-            print s
-            exit
-          }
+          if (q == s)          { print s "\ts"; next }
+          if (q == t)          { print s "\tt"; next }
+          if (q == pane_title) { print s "\tp"; next }
         }
       '
 }
 
 # title/pane-name/ref → surface:N. 모든 resolve 는 현재 workspace 안으로 제한한다.
-# 다중 매치 시 현재 workspace 내 첫 번째. 실패 시 stderr + rc 6.
+# 다중 매치 시 가장 낮은 surface:N 을 선택하고 stderr 로 경고. CMUX_V5_RESOLVE_TRACE=on
+# 으로 매칭 키(s=surface:N 그 자체, t=surface title, p=pane title) 까지 stderr 노출.
+# 실패 시 stderr + rc 6.
 _cmux_v5_resolve() {
-  local arg="$1"
-  local ref
+  local arg="$1" ref out n
   if [[ "$arg" =~ ^surface:[0-9]+$ ]]; then
     if _cmux_v5_surface_in_current_workspace "$arg"; then
       printf '%s' "$arg"
@@ -166,10 +168,20 @@ _cmux_v5_resolve() {
     printf '[cmux v5] refusing "%s" — target is not in the current workspace\n' "$arg" >&2
     return 6
   fi
-  ref="$(_cmux_v5_resolve_in_current_workspace "$arg")"
-  if [ -z "$ref" ]; then
+  out="$(_cmux_v5_resolve_in_current_workspace "$arg")"
+  if [ -z "$out" ]; then
     printf '[cmux v5] cannot resolve "%s" in current workspace — use a pane/surface title from this workspace\n' "$arg" >&2
     return 6
+  fi
+  n="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+  if [ "$n" -gt 1 ]; then
+    printf '[cmux v5] resolve: "%s" matched %d surfaces — picking lowest:\n%s\n' \
+      "$arg" "$n" "$out" >&2
+  fi
+  ref="$(printf '%s\n' "$out" | sort -V | head -1 | cut -f1)"
+  if [ "${CMUX_V5_RESOLVE_TRACE:-off}" = on ]; then
+    printf '[cmux v5] resolve trace: query="%s" picked=%s candidates:\n%s\n' \
+      "$arg" "$ref" "$out" >&2
   fi
   printf '%s' "$ref"
 }

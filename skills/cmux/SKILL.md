@@ -108,6 +108,7 @@ target 인자는 현재 workspace 안의 pane name, surface title, 또는 `surfa
 | `CMUX_V5_QUIET` | off | stderr status 숨김 |
 | `CMUX_V5_ENTER_DELAY` | 0.15 | send 후 Enter 지연 |
 | `CMUX_V5_ENTER_DOUBLE` | on | Enter 재송신 보험 |
+| `CMUX_V5_RESOLVE_TRACE` | off | `on|off` ; title/pane 매칭 결정 + 다중매치 후보를 stderr 로 노출 |
 
 ## Mode
 
@@ -138,6 +139,8 @@ fallback을 켜면 prompt에 marker 지시가 추가되고, 실패 시 `cmux rea
 - 모드 감지 실패는 `--mode llm` 또는 `--mode worker`로 해결한다.
 - 전송 race가 보이면 `CMUX_V5_ENTER_DELAY`를 조금 올리거나 `CMUX_V5_ENTER_DOUBLE=on`을 유지한다.
 - 실패를 timeout까지 기다리기 싫으면 `CMUX_V5_EARLY_IDLE=worker` 또는 `on`을 쓴다.
+- 같은 title의 surface가 여러 개면 가장 낮은 `surface:N`이 선택되고 stderr에 다중매치 경고가 출력된다. 어떤 surface/키로 매칭됐는지 확인하려면 `CMUX_V5_RESOLVE_TRACE=on`을 켠다.
+- 직전 트리가 rename 이전이면(방금 surface를 rename/new 했는데도 옛 title로 매칭될 때) `CMUX_V5_TREE_TTL=0`을 호출 직전에 export 해서 3초 캐시를 우회한다.
 
 ## 호환
 

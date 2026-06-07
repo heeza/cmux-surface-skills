@@ -437,6 +437,72 @@ test_cmux_cross_two_arg_defaults() {
   pass "cmux_cross two-arg form uses rounds=3 and timeout=1800 by default"
 }
 
+test_resolve_picks_lowest_on_duplicate_titles() {
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 [focused] ◀ active
+    │   └── surface surface:5 [terminal] "codex" [selected] tty=ttys001
+    └── pane pane:2
+        └── surface surface:9 [terminal] "codex" [selected] ◀ here tty=ttys002'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+
+  local resolved err
+  set +e
+  err="$(_cmux_v5_resolve "codex" 2>&1 >/dev/null)"
+  resolved="$(_cmux_v5_resolve "codex" 2>/dev/null)"
+  set -e
+
+  [ "$resolved" = "surface:5" ] || fail "duplicate title resolved to '$resolved', want surface:5"
+  echo "$err" | grep -q "matched 2 surfaces" || fail "no multi-match warning: $err"
+  echo "$err" | grep -q "surface:9" || fail "warning should list surface:9: $err"
+  pass "duplicate titles → lowest surface:N + stderr warning"
+}
+
+test_resolve_trace_off_emits_no_decision_log() {
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 [focused] ◀ active
+    │   └── surface surface:1 [terminal] "codex" [selected] tty=ttys001
+    └── pane pane:2
+        └── surface surface:9 [terminal] "zsh" [selected] ◀ here tty=ttys002'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+  unset CMUX_V5_RESOLVE_TRACE
+
+  local err
+  set +e
+  err="$(_cmux_v5_resolve "codex" 2>&1 >/dev/null)"
+  set -e
+
+  [ -z "$err" ] || fail "trace=off should not emit stderr on unique match: $err"
+  pass "trace off keeps stderr clean on unique match"
+}
+
+test_resolve_trace_on_logs_match_key() {
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 "dev" [focused] ◀ active
+    │   └── surface surface:9 [terminal] "" [selected] tty=ttys001
+    └── pane pane:2
+        └── surface surface:2 [terminal] "zsh" [selected] ◀ here tty=ttys002'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+  export CMUX_V5_RESOLVE_TRACE=on
+
+  local err resolved
+  set +e
+  err="$(_cmux_v5_resolve "dev" 2>&1 >/dev/null)"
+  resolved="$(_cmux_v5_resolve "dev" 2>/dev/null)"
+  set -e
+  unset CMUX_V5_RESOLVE_TRACE
+
+  [ "$resolved" = "surface:9" ] || fail "pane_title match failed: $resolved"
+  echo "$err" | grep -q "resolve trace" || fail "no trace log: $err"
+  echo "$err" | grep -q "surface:9	p" || fail "trace should mark pane_title key: $err"
+  pass "trace=on shows matching key on stderr"
+}
+
 test_collect_timeout_preserves_fifo
 test_collect_success_unlinks_fifo
 test_truncation_metadata_is_out_of_band
@@ -451,5 +517,8 @@ test_cmux_watch_collects_without_manual_input
 test_cmux_send_returns_result_by_default
 test_cmux_send_no_watch_returns_job_id
 test_short_aliases_delegate_hot_path
+test_resolve_picks_lowest_on_duplicate_titles
+test_resolve_trace_off_emits_no_decision_log
+test_resolve_trace_on_logs_match_key
 test_cmux_cross_carries_objective_and_transcript
 test_cmux_cross_two_arg_defaults
