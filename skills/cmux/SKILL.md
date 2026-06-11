@@ -93,6 +93,8 @@ target 인자는 현재 workspace 안의 pane name, surface title, 또는 `surfa
 | `CMUX_V5_PROMPT_MAX` | 500 | prompt 글자 cap |
 | `CMUX_V5_RESPONSE_MAX` | 4096 | 응답 바이트 cap |
 | `CMUX_V5_TIMEOUT` | 1200 | `.ans` 응답 polling 최대 초 (20분) |
+| `CMUX_V5_SEND_TIMEOUT` | 3600 | `cmux_send`/`cmuxs` 기본 watch 최대 초 (1시간) |
+| `CMUX_V5_WATCH_INTERVAL` | 15 | `cmux_send`/`cmuxs` 기본 watch status 간격(초) |
 | `CMUX_V5_AUTO_CAP` | on | LLM 수신 규칙 자동 첨부 |
 | `CMUX_V5_TREE_TTL` | 3 | `cmux tree` 캐시 TTL(초). resolve→detect→read 간 fork 재사용 |
 | `CMUX_V5_CROSS_TIMEOUT` | 1800 | `cmux_cross` 각 LLM 호출 timeout(초). 기본 30분 |

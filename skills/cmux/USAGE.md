@@ -167,7 +167,7 @@ result=$(cmux_ask_unsafe surface:9 "$LONG_PROMPT" \
 
 ### 2.3 `cmux_send` — 송신 후 기본 watch
 
-- **무엇** — fifo 생성 + cmux send 후 기본으로 `cmux_watch`를 실행해 최종 결과를 stdout으로 반환. 기본 timeout은 `CMUX_V5_TIMEOUT=1200`(20분).
+- **무엇** — fifo 생성 + cmux send 후 기본으로 `cmux_watch`를 실행해 최종 결과를 stdout으로 반환. 기본 timeout은 `CMUX_V5_SEND_TIMEOUT=3600`(1시간).
 - **언제** — 다음 4가지 케이스. 그 외엔 `cmux_ask` 가 더 간단.
 - **target** — 현재 workspace 안의 pane name 또는 surface title을 권장. `surface:N`도 가능하지만 같은 workspace에 있을 때만 허용.
 
@@ -637,7 +637,9 @@ worker mode는 `{ command; } > <job>.ans.tmp 2>&1; mv ... <job>.ans` 패턴이�
 [SKILL.md 기본값](SKILL.md#기본값) 참조. 핵심:
 
 - `CMUX_V5_QUIET=on` — stderr status line 끔
-- `CMUX_V5_TIMEOUT=1200` — ask/send/watch/collect default timeout (20분)
+- `CMUX_V5_TIMEOUT=1200` — ask/watch/collect default timeout (20분)
+- `CMUX_V5_SEND_TIMEOUT=3600` — cmux_send/cmuxs default watch timeout (1시간)
+- `CMUX_V5_WATCH_INTERVAL=15` — cmux_send/cmuxs default watch status interval
 - `CMUX_V5_RESPONSE_MAX=65536` — 응답 cap 늘림
 - `CMUX_V5_PROMPT_STYLE=compact` — LLM 주입 규칙을 짧게 유지 (default)
 - `CMUX_V5_FALLBACK_SCREEN=on` — Bash/FIFO 실패 시에만 screen marker fallback opt-in

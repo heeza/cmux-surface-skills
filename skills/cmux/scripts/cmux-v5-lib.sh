@@ -28,6 +28,8 @@
 : "${CMUX_V5_PROMPT_MAX:=500}"      # prompt 글자 cap
 : "${CMUX_V5_RESPONSE_MAX:=4096}"   # 응답 바이트 cap
 : "${CMUX_V5_TIMEOUT:=1200}"        # 응답 대기(.ans 폴링) 최대 초 — 기본 20분
+: "${CMUX_V5_SEND_TIMEOUT:=3600}"   # cmux_send/cmuxs 기본 watch 최대 초 — 기본 1시간
+: "${CMUX_V5_WATCH_INTERVAL:=15}"   # cmux_send/cmuxs 기본 watch status 간격(초)
 : "${CMUX_V5_AUTO_CAP:=on}"         # on|off — prompt 끝에 안내문 자동 첨부
 : "${CMUX_V5_TREE_TTL:=3}"          # cmux tree 캐시 TTL(초). resolve→detect→dynamic 간 tree fork 재사용
 : "${CMUX_V5_FIFO_DIR:=/tmp/cmux-fifo}"
@@ -127,6 +129,19 @@ _cmux_v5_resolve_in_current_workspace() {
 
   _cmux_v5_get_tree_focused \
     | awk -v want_ws="$ws" -v q="$arg" '
+        function add_candidate(prio, surface) {
+          if (best_prio == 0 || prio < best_prio) {
+            best_prio = prio
+            best_count = 0
+            delete best_seen
+            delete best_surfaces
+          }
+          if (prio == best_prio && !(surface in best_seen)) {
+            best_seen[surface] = 1
+            best_count++
+            best_surfaces[best_count] = surface
+          }
+        }
         function title(line) {
           if (match(line, /"[^"]+"/)) return substr(line, RSTART+1, RLENGTH-2)
           return ""
@@ -147,19 +162,32 @@ _cmux_v5_resolve_in_current_workspace() {
         match($0, /surface:[0-9]+/) {
           s = substr($0, RSTART, RLENGTH)
           t = title($0)
-          if (q == s)          { print s "\ts"; next }
-          if (q == t)          { print s "\tt"; next }
-          if (q == pane_title) { print s "\tp"; next }
+          if (q == s) add_candidate(1, s)
+          if (q == t) add_candidate(2, s)
+          if (q == pane_title) add_candidate(3, s)
+        }
+        END {
+          if (best_count == 1) {
+            print best_surfaces[1]
+            exit 0
+          }
+          if (best_count > 1) {
+            msg = "[cmux v5] ambiguous target \"" q "\" in current workspace:"
+            for (i = 1; i <= best_count; i++) msg = msg " " best_surfaces[i]
+            print msg > "/dev/stderr"
+            exit 6
+          }
+          exit 1
         }
       '
 }
 
 # title/pane-name/ref → surface:N. 모든 resolve 는 현재 workspace 안으로 제한한다.
-# 다중 매치 시 가장 낮은 surface:N 을 선택하고 stderr 로 경고. CMUX_V5_RESOLVE_TRACE=on
-# 으로 매칭 키(s=surface:N 그 자체, t=surface title, p=pane title) 까지 stderr 노출.
-# 실패 시 stderr + rc 6.
+# 매칭 우선순위: 1) surface:N 그 자체 > 2) surface title > 3) pane title.
+# 같은 priority 에서 복수 매치면 모호한 것으로 보고 stderr + rc 6.
+# CMUX_V5_RESOLVE_TRACE=on 으로 stderr 에 picked + priority 매핑까지 노출.
 _cmux_v5_resolve() {
-  local arg="$1" ref out n
+  local arg="$1" ref
   if [[ "$arg" =~ ^surface:[0-9]+$ ]]; then
     if _cmux_v5_surface_in_current_workspace "$arg"; then
       printf '%s' "$arg"
@@ -168,20 +196,18 @@ _cmux_v5_resolve() {
     printf '[cmux v5] refusing "%s" — target is not in the current workspace\n' "$arg" >&2
     return 6
   fi
-  out="$(_cmux_v5_resolve_in_current_workspace "$arg")"
-  if [ -z "$out" ]; then
+  ref="$(_cmux_v5_resolve_in_current_workspace "$arg")"
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+    return "$rc"
+  fi
+  if [ -z "$ref" ]; then
     printf '[cmux v5] cannot resolve "%s" in current workspace — use a pane/surface title from this workspace\n' "$arg" >&2
     return 6
   fi
-  n="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
-  if [ "$n" -gt 1 ]; then
-    printf '[cmux v5] resolve: "%s" matched %d surfaces — picking lowest:\n%s\n' \
-      "$arg" "$n" "$out" >&2
-  fi
-  ref="$(printf '%s\n' "$out" | sort -V | head -1 | cut -f1)"
   if [ "${CMUX_V5_RESOLVE_TRACE:-off}" = on ]; then
-    printf '[cmux v5] resolve trace: query="%s" picked=%s candidates:\n%s\n' \
-      "$arg" "$ref" "$out" >&2
+    printf '[cmux v5] resolve trace: query="%s" picked=%s (priority 1=surface:N, 2=surface title, 3=pane title)\n' \
+      "$arg" "$ref" >&2
   fi
   printf '%s' "$ref"
 }
@@ -619,7 +645,9 @@ _cmux_v5_surface_title() {
   [ -z "$surface" ] && return 1
   _cmux_v5_get_tree \
     | awk -v s="$surface" '
-        index($0, s) > 0 {
+        match($0, /surface:[0-9]+/) {
+          surface = substr($0, RSTART, RLENGTH)
+          if (surface != s) next
           if (match($0, /"[^"]+"/)) {
             print substr($0, RSTART+1, RLENGTH-2); exit
           }
@@ -630,7 +658,11 @@ _cmux_v5_surface_focus_line() {
   local surface="$1"
   [ -z "$surface" ] && return 1
   _cmux_v5_get_tree_focused \
-    | awk -v s="$surface" 'index($0, s) > 0 { print; exit }'
+    | awk -v s="$surface" '
+        match($0, /surface:[0-9]+/) {
+          surface = substr($0, RSTART, RLENGTH)
+          if (surface == s) { print; exit }
+        }'
 }
 
 _cmux_v5_surface_has_input_prompt() {
@@ -1248,7 +1280,7 @@ cmux_send() {
     printf 'usage: cmux_send <surface> <prompt> [--mode llm|worker] [--timeout N --watch-interval N --response-max N] [--no-watch]\n' >&2
     return 2
   fi
-  local surface="$1" prompt="$2" mode="" watch=1 timeout="$CMUX_V5_TIMEOUT" watch_interval=5 rmax="$CMUX_V5_RESPONSE_MAX"
+  local surface="$1" prompt="$2" mode="" watch=1 timeout="$CMUX_V5_SEND_TIMEOUT" watch_interval="$CMUX_V5_WATCH_INTERVAL" rmax="$CMUX_V5_RESPONSE_MAX"
   shift 2
   while [ $# -gt 0 ]; do
     case "$1" in

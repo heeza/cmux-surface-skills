@@ -235,6 +235,60 @@ test_resolve_accepts_pane_name_in_current_workspace() {
   pass "pane name resolves to surface in current workspace"
 }
 
+test_resolve_prefers_surface_title_over_pane_title() {
+  local resolved
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 "agy"
+    │   └── surface surface:8 [terminal] "codex" [selected] tty=ttys008
+    └── pane pane:2 [focused] ◀ active
+        └── surface surface:9 [terminal] "agy" [selected] ◀ active ◀ here tty=ttys009'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+
+  resolved="$(_cmux_v5_resolve "agy")"
+  [ "$resolved" = "surface:9" ] || fail "surface title did not beat pane title, resolved '$resolved'"
+  pass "surface title takes precedence over pane title"
+}
+
+test_resolve_rejects_duplicate_surface_titles() {
+  local rc
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 [focused] ◀ active
+    │   └── surface surface:1 [terminal] "codex" [selected] ◀ active ◀ here tty=ttys001
+    ├── pane pane:2
+    │   └── surface surface:8 [terminal] "agy" [selected] tty=ttys008
+    └── pane pane:3
+        └── surface surface:9 [terminal] "agy" [selected] tty=ttys009'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+
+  set +e
+  _cmux_v5_resolve "agy" >/dev/null 2>/dev/null
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 6 ] || fail "duplicate surface titles resolved with rc=$rc, expected 6"
+  pass "duplicate surface titles are ambiguous"
+}
+
+test_surface_title_matches_exact_surface_id() {
+  local title
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1
+    │   └── surface surface:10 [terminal] "ten" [selected] tty=ttys010
+    └── pane pane:2 [focused] ◀ active
+        └── surface surface:1 [terminal] "one" [selected] ◀ active ◀ here tty=ttys001'
+  _CMUX_V5_TREE_CACHE=""
+  _CMUX_V5_TREE_CACHE_TIME=0
+
+  title="$(_cmux_v5_surface_title "surface:1")"
+  [ "$title" = "one" ] || fail "surface:1 title matched '$title'"
+  pass "surface title lookup matches exact surface id"
+}
+
 test_resolve_rejects_surface_outside_current_workspace() {
   export CMUX_TEST_TREE='window window:1 [current] ◀ active
 ├── workspace workspace:1 "current" [selected] ◀ active
@@ -336,6 +390,33 @@ test_cmux_send_no_watch_returns_job_id() {
   esac
   cmux_cancel "$out" >/dev/null 2>/dev/null || true
   pass "cmux_send --no-watch returns job id"
+}
+
+test_cmux_send_uses_long_send_defaults() {
+  local args_file="$TMP_ROOT/send-watch-defaults.args"
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    ├── pane pane:1 [focused] ◀ active
+    │   └── surface surface:1 [terminal] "codex" [selected] ◀ active ◀ here tty=ttys001
+    └── pane pane:2 "reviewer"
+        └── surface surface:9 [terminal] "claudee" [selected] tty=ttys002'
+  _CMUX_V5_TREE_FOCUSED_CACHE=""
+  _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
+
+  (
+    cmux_watch() {
+      printf '%s\n' "$@" > "$args_file"
+      return 0
+    }
+    cmux_send "surface:9" "ping" --mode llm >/dev/null 2>/dev/null
+  )
+
+  grep -q -- '--timeout' "$args_file" || fail "cmux_send did not pass --timeout to cmux_watch"
+  grep -q '^3600$' "$args_file" || fail "cmux_send default timeout was not 3600"
+  grep -q -- '--interval' "$args_file" || fail "cmux_send did not pass --interval to cmux_watch"
+  grep -q '^15$' "$args_file" || fail "cmux_send default watch interval was not 15"
+  rm -f "$CMUX_V5_FIFO_DIR"/surface_9-*.res
+  pass "cmux_send uses long send-specific defaults"
 }
 
 test_short_aliases_delegate_hot_path() {
@@ -732,11 +813,15 @@ test_worker_focus_guard_blocks_active_surface
 test_cmux_send_worker_guard_blocks_before_fifo
 test_worker_focus_guard_allows_inactive_surface
 test_resolve_accepts_pane_name_in_current_workspace
+test_resolve_prefers_surface_title_over_pane_title
+test_resolve_rejects_duplicate_surface_titles
+test_surface_title_matches_exact_surface_id
 test_resolve_rejects_surface_outside_current_workspace
 test_collect_rejects_job_outside_current_workspace
 test_cmux_watch_collects_without_manual_input
 test_cmux_send_returns_result_by_default
 test_cmux_send_no_watch_returns_job_id
+test_cmux_send_uses_long_send_defaults
 test_short_aliases_delegate_hot_path
 test_resolve_picks_lowest_on_duplicate_titles
 test_resolve_trace_off_emits_no_decision_log
