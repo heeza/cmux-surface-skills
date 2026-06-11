@@ -251,26 +251,28 @@ test_resolve_prefers_surface_title_over_pane_title() {
   pass "surface title takes precedence over pane title"
 }
 
-test_resolve_rejects_duplicate_surface_titles() {
-  local rc
+test_resolve_duplicate_surface_titles_warn_and_pick_lowest() {
+  local rc resolved
   export CMUX_TEST_TREE='window window:1 [current] ◀ active
 └── workspace workspace:1 "test" [selected] ◀ active
     ├── pane pane:1 [focused] ◀ active
     │   └── surface surface:1 [terminal] "codex" [selected] ◀ active ◀ here tty=ttys001
     ├── pane pane:2
-    │   └── surface surface:8 [terminal] "agy" [selected] tty=ttys008
+    │   └── surface surface:9 [terminal] "agy" [selected] tty=ttys009
     └── pane pane:3
-        └── surface surface:9 [terminal] "agy" [selected] tty=ttys009'
+        └── surface surface:8 [terminal] "agy" [selected] tty=ttys008'
   _CMUX_V5_TREE_FOCUSED_CACHE=""
   _CMUX_V5_TREE_FOCUSED_CACHE_TIME=0
 
   set +e
-  _cmux_v5_resolve "agy" >/dev/null 2>/dev/null
+  resolved="$(_cmux_v5_resolve "agy" 2>/dev/null)"
   rc=$?
   set -e
 
-  [ "$rc" -eq 6 ] || fail "duplicate surface titles resolved with rc=$rc, expected 6"
-  pass "duplicate surface titles are ambiguous"
+  [ "$rc" -eq 0 ] || fail "duplicate surface titles resolved with rc=$rc, expected 0"
+  # tree 등장 순서가 9,8 이어도 숫자상 lowest 인 surface:8 을 골라야 한다.
+  [ "$resolved" = "surface:8" ] || fail "duplicate titles resolved to '$resolved', want surface:8"
+  pass "duplicate surface titles warn and pick numerically lowest"
 }
 
 test_surface_title_matches_exact_surface_id() {
@@ -805,8 +807,58 @@ test_trace_and_metrics_report_job_registry_state() {
   pass "cmux_trace and cmux_metrics report job registry state"
 }
 
+test_collect_empty_answer_returns_immediately() {
+  local fifo ans rc out start elapsed
+  fifo="$(make_fifo "job-empty-ans")"
+  ans="${fifo%.res}.ans"
+  # side-effect-only worker 답변: 0바이트 .ans 가 atomic 하게 나타난 상태.
+  : > "$ans"
+
+  start="$(date +%s)"
+  set +e
+  out="$(cmux_collect "job-empty-ans" --timeout 10 2>/dev/null)"
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - start ))
+
+  [ "$rc" -eq 0 ] || fail "empty answer collect rc=$rc, expected 0"
+  [ -z "$out" ] || fail "empty answer collect output was '$out'"
+  [ "$elapsed" -lt 5 ] || fail "empty answer collect took ${elapsed}s — hang until timeout"
+  [ ! -e "$fifo" ] || fail "empty answer collect left FIFO behind"
+  [ ! -e "$ans" ] || fail "empty answer collect left .ans behind"
+  pass "empty .ans answer returns immediately instead of hanging"
+}
+
+test_detect_falls_back_to_title_hint() {
+  local mode
+  # tty 가 tree 에 없으면 ps 기반 감지가 불가 → title 키워드 폴백으로 llm.
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    └── pane pane:1 [focused] ◀ active
+        └── surface surface:9 [terminal] "codex-main" [selected] ◀ here'
+  _CMUX_V5_TREE_CACHE=""
+  _CMUX_V5_TREE_CACHE_TIME=0
+
+  mode="$(_cmux_v5_detect "surface:9")" || true
+  [ "$mode" = "llm" ] || fail "title hint detect returned '$mode', want llm"
+
+  # LLM 키워드가 없는 title 은 여전히 unknown.
+  export CMUX_TEST_TREE='window window:1 [current] ◀ active
+└── workspace workspace:1 "test" [selected] ◀ active
+    └── pane pane:1 [focused] ◀ active
+        └── surface surface:9 [terminal] "build-log" [selected] ◀ here'
+  _CMUX_V5_TREE_CACHE=""
+  _CMUX_V5_TREE_CACHE_TIME=0
+
+  mode="$(_cmux_v5_detect "surface:9")" || true
+  [ "$mode" = "unknown" ] || fail "non-llm title detect returned '$mode', want unknown"
+  pass "mode detect falls back to surface title hint"
+}
+
 test_collect_timeout_preserves_fifo
 test_collect_success_unlinks_fifo
+test_collect_empty_answer_returns_immediately
+test_detect_falls_back_to_title_hint
 test_truncation_metadata_is_out_of_band
 test_truncation_keeps_utf8_boundary
 test_worker_focus_guard_blocks_active_surface
@@ -814,7 +866,7 @@ test_cmux_send_worker_guard_blocks_before_fifo
 test_worker_focus_guard_allows_inactive_surface
 test_resolve_accepts_pane_name_in_current_workspace
 test_resolve_prefers_surface_title_over_pane_title
-test_resolve_rejects_duplicate_surface_titles
+test_resolve_duplicate_surface_titles_warn_and_pick_lowest
 test_surface_title_matches_exact_surface_id
 test_resolve_rejects_surface_outside_current_workspace
 test_collect_rejects_job_outside_current_workspace

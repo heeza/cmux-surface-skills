@@ -59,27 +59,77 @@ _CMUX_V5_GC_DONE=0
 _CMUX_V5_JOBGC_DONE=0
 CMUX_V5_LAST_TRUNCATED=0
 
+# tree 캐시 L2 (파일). 셸 변수 L1 은 command substitution 서브셸 안에서 갱신해도
+# 부모로 전파되지 않고, Bash tool 호출마다 새 셸이 lib 를 재source 하므로 L1 만으로는
+# resolve→detect→collect 경로가 cmux tree 를 호출부마다 다시 fork 한다. 첫 줄에 epoch,
+# 나머지에 본문을 담은 파일을 temp+mv 원자 교체로 공유해 TTL 내 재사용한다.
+# CMUX_V5_TREE_TTL=0 이면 L1/L2 모두 bypass (테스트·rename 직후 강제 재조회 용).
+# _cmux_v5_tree_cache_read <file> <now> <ttl> -> TTL 내 본문 출력(rc 0), 아니면 rc 1.
+_cmux_v5_tree_cache_read() {
+  local f="$1" now="$2" ttl="$3" content ts body
+  [ -f "$f" ] || return 1
+  content="$(<"$f")" 2>/dev/null || return 1
+  ts="${content%%$'\n'*}"
+  body="${content#*$'\n'}"
+  [ "$ts" = "$content" ] && return 1   # 본문 없는 캐시(개행 미포함)는 미스 취급
+  case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((now - ts)) -lt "$ttl" ] || return 1
+  [ -n "$body" ] || return 1
+  printf '%s\n' "$body"
+}
+
+# _cmux_v5_tree_cache_write <file> <now> <body> — 원자 기록. 실패는 조용히 무시(캐시는 최선노력).
+_cmux_v5_tree_cache_write() {
+  local f="$1" now="$2" body="$3" tmp
+  [ -d "$CMUX_V5_FIFO_DIR" ] || mkdir -p "$CMUX_V5_FIFO_DIR" 2>/dev/null || return 0
+  tmp="$(mktemp "$f.tmp.XXXXXX" 2>/dev/null)" || return 0
+  { printf '%s\n' "$now"; printf '%s\n' "$body"; } > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$f" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 _cmux_v5_get_tree() {
-  local now
+  local now ttl="${CMUX_V5_TREE_TTL:-3}" cached
   now=$(date +%s)
-  if [ -n "$_CMUX_V5_TREE_CACHE" ] && [ $((now - _CMUX_V5_TREE_CACHE_TIME)) -lt "${CMUX_V5_TREE_TTL:-3}" ]; then
+  if [ -n "$_CMUX_V5_TREE_CACHE" ] && [ $((now - _CMUX_V5_TREE_CACHE_TIME)) -lt "$ttl" ]; then
     printf '%s\n' "$_CMUX_V5_TREE_CACHE"
+    return 0
+  fi
+  if [ "$ttl" -gt 0 ] \
+     && cached="$(_cmux_v5_tree_cache_read "$CMUX_V5_FIFO_DIR/.tree-all.cache" "$now" "$ttl")"; then
+    _CMUX_V5_TREE_CACHE="$cached"
+    _CMUX_V5_TREE_CACHE_TIME="$now"
+    printf '%s\n' "$cached"
     return 0
   fi
   _CMUX_V5_TREE_CACHE="$(cmux tree --all 2>/dev/null)"
   _CMUX_V5_TREE_CACHE_TIME="$now"
+  if [ "$ttl" -gt 0 ] && [ -n "$_CMUX_V5_TREE_CACHE" ]; then
+    _cmux_v5_tree_cache_write "$CMUX_V5_FIFO_DIR/.tree-all.cache" "$now" "$_CMUX_V5_TREE_CACHE"
+  fi
   printf '%s\n' "$_CMUX_V5_TREE_CACHE"
 }
 
 _cmux_v5_get_tree_focused() {
-  local now
+  local now ttl="${CMUX_V5_TREE_TTL:-3}" cached
   now=$(date +%s)
-  if [ -n "$_CMUX_V5_TREE_FOCUSED_CACHE" ] && [ $((now - _CMUX_V5_TREE_FOCUSED_CACHE_TIME)) -lt "${CMUX_V5_TREE_TTL:-3}" ]; then
+  if [ -n "$_CMUX_V5_TREE_FOCUSED_CACHE" ] && [ $((now - _CMUX_V5_TREE_FOCUSED_CACHE_TIME)) -lt "$ttl" ]; then
     printf '%s\n' "$_CMUX_V5_TREE_FOCUSED_CACHE"
+    return 0
+  fi
+  if [ "$ttl" -gt 0 ] \
+     && cached="$(_cmux_v5_tree_cache_read "$CMUX_V5_FIFO_DIR/.tree-focused.cache" "$now" "$ttl")"; then
+    _CMUX_V5_TREE_FOCUSED_CACHE="$cached"
+    _CMUX_V5_TREE_FOCUSED_CACHE_TIME="$now"
+    printf '%s\n' "$cached"
     return 0
   fi
   _CMUX_V5_TREE_FOCUSED_CACHE="$(cmux tree 2>/dev/null)"
   _CMUX_V5_TREE_FOCUSED_CACHE_TIME="$now"
+  if [ "$ttl" -gt 0 ] && [ -n "$_CMUX_V5_TREE_FOCUSED_CACHE" ]; then
+    _cmux_v5_tree_cache_write "$CMUX_V5_FIFO_DIR/.tree-focused.cache" "$now" "$_CMUX_V5_TREE_FOCUSED_CACHE"
+  fi
   printf '%s\n' "$_CMUX_V5_TREE_FOCUSED_CACHE"
 }
 
@@ -167,15 +217,27 @@ _cmux_v5_resolve_in_current_workspace() {
           if (q == pane_title) add_candidate(3, s)
         }
         END {
+          # 출력 = "<surface>\t<priority>" — 호출자(_cmux_v5_resolve)가 trace 용
+          # 매칭키를 알 수 있게 priority 를 함께 내보낸다(외부 노출 전 strip).
           if (best_count == 1) {
-            print best_surfaces[1]
+            print best_surfaces[1] "\t" best_prio
             exit 0
           }
           if (best_count > 1) {
-            msg = "[cmux v5] ambiguous target \"" q "\" in current workspace:"
-            for (i = 1; i <= best_count; i++) msg = msg " " best_surfaces[i]
+            # 같은 priority 다중매치 → 숫자상 가장 낮은 surface:N 선택 (SKILL.md 계약).
+            # 하드 에러(rc 6)로 죽이면 동일 title pane 이 둘만 떠도 모든 호출이 실패한다.
+            pick = best_surfaces[1]
+            pick_n = substr(pick, 9) + 0
+            for (i = 2; i <= best_count; i++) {
+              n = substr(best_surfaces[i], 9) + 0
+              if (n < pick_n) { pick = best_surfaces[i]; pick_n = n }
+            }
+            msg = "[cmux v5] \"" q "\" matched " best_count " surfaces ("
+            for (i = 1; i <= best_count; i++) msg = msg (i > 1 ? " " : "") best_surfaces[i]
+            msg = msg ") in current workspace — picked lowest " pick
             print msg > "/dev/stderr"
-            exit 6
+            print pick "\t" best_prio
+            exit 0
           }
           exit 1
         }
@@ -184,7 +246,7 @@ _cmux_v5_resolve_in_current_workspace() {
 
 # title/pane-name/ref → surface:N. 모든 resolve 는 현재 workspace 안으로 제한한다.
 # 매칭 우선순위: 1) surface:N 그 자체 > 2) surface title > 3) pane title.
-# 같은 priority 에서 복수 매치면 모호한 것으로 보고 stderr + rc 6.
+# 같은 priority 에서 복수 매치면 숫자상 가장 낮은 surface:N 선택 + stderr 경고.
 # CMUX_V5_RESOLVE_TRACE=on 으로 stderr 에 picked + priority 매핑까지 노출.
 _cmux_v5_resolve() {
   local arg="$1" ref
@@ -205,9 +267,18 @@ _cmux_v5_resolve() {
     printf '[cmux v5] cannot resolve "%s" in current workspace — use a pane/surface title from this workspace\n' "$arg" >&2
     return 6
   fi
+  # "<surface>\t<priority>" 분해 — priority 는 trace 용 매칭키로만 쓰고 strip.
+  local key="${ref#*$'\t'}"
+  ref="${ref%%$'\t'*}"
+  case "$key" in
+    1) key=s ;;  # surface:N 그 자체
+    2) key=t ;;  # surface title
+    3) key=p ;;  # pane title
+    *) key='?' ;;
+  esac
   if [ "${CMUX_V5_RESOLVE_TRACE:-off}" = on ]; then
-    printf '[cmux v5] resolve trace: query="%s" picked=%s (priority 1=surface:N, 2=surface title, 3=pane title)\n' \
-      "$arg" "$ref" >&2
+    printf '[cmux v5] resolve trace: query="%s" picked=%s\t%s (key: s=surface ref, t=surface title, p=pane title)\n' \
+      "$arg" "$ref" "$key" >&2
   fi
   printf '%s' "$ref"
 }
@@ -276,8 +347,8 @@ _cmux_v5_garbage_collect() {
   [ "$_CMUX_V5_GC_DONE" = "1" ] && return 0
   _CMUX_V5_GC_DONE=1
   find "$CMUX_V5_FIFO_DIR" -type p -mmin +720 -delete 2>/dev/null &
-  # 회수 안 된 .ans/.ans.tmp(늦은 답 잔재) 도 같은 TTL 로 정리.
-  find "$CMUX_V5_FIFO_DIR" -type f \( -name '*.ans' -o -name '*.ans.tmp' \) -mmin +720 -delete 2>/dev/null &
+  # 회수 안 된 .ans/.ans.tmp(늦은 답 잔재) + 죽은 프로세스의 tree 캐시 tmp 도 같은 TTL 로 정리.
+  find "$CMUX_V5_FIFO_DIR" -type f \( -name '*.ans' -o -name '*.ans.tmp' -o -name '.tree-*.cache.tmp.*' \) -mmin +720 -delete 2>/dev/null &
   # stale lock 디렉터리 백스톱 정리: ts-file 내용 기반 stale 은 acquire 시 break 하므로
   # 여기선 디렉터리 mtime 이 TTL 보다 오래된 *.lock 만 coarse 하게 제거.
   [ -d "$CMUX_V5_LOCK_DIR" ] && find "$CMUX_V5_LOCK_DIR" -type d -name '*.lock' -mmin +$(( ${CMUX_V5_LOCK_TTL:-300} / 60 + 1 )) -exec rm -rf {} + 2>/dev/null &
@@ -691,21 +762,30 @@ _cmux_v5_worker_send_guard() {
   return 0
 }
 
+# surface ref → tty (없으면 빈). surface 토큰 정확 일치 라인만 매칭 —
+# regex substring($0 ~ s)은 surface:1 이 surface:10 라인에 오매칭되는 버그가 있었다.
+_cmux_v5_surface_tty() {
+  local surface="$1"
+  [ -z "$surface" ] && return 1
+  _cmux_v5_get_tree \
+    | awk -v s="$surface" '
+        match($0, /surface:[0-9]+/) {
+          if (substr($0, RSTART, RLENGTH) != s) next
+          if (match($0, /tty=[^ ]+/)) {
+            print substr($0, RSTART+4, RLENGTH-4)
+          }
+          exit
+        }'
+}
+
 # echo: llm | worker | unknown
 _cmux_v5_detect() {
   local surface="$1" tty short
 
-  # surface ref → tty. surface UUID 도 cmux tree 가 표시하므로 substring match
-  tty="$(_cmux_v5_get_tree \
-    | awk -v s="$surface" '
-        $0 ~ s {
-          if (match($0, /tty=[^ ]+/)) {
-            print substr($0, RSTART+4, RLENGTH-4); exit
-          }
-        }')"
+  tty="$(_cmux_v5_surface_tty "$surface")"
   if [ -z "$tty" ]; then
-    echo unknown
-    return 1
+    _cmux_v5_detect_title_hint "$surface"
+    return $?
   fi
 
   short="${tty##/dev/}"
@@ -714,8 +794,8 @@ _cmux_v5_detect() {
   local procs
   procs="$(ps -ww -t "$short" -o args= 2>/dev/null)"
   if [ -z "$procs" ]; then
-    echo unknown
-    return 1
+    _cmux_v5_detect_title_hint "$surface"
+    return $?
   fi
 
   # LLM 우선 매칭 (LLM 이 떠 있으면 shell 도 같이 있는 게 정상).
@@ -731,6 +811,22 @@ _cmux_v5_detect() {
     echo worker; return 0
   fi
 
+  _cmux_v5_detect_title_hint "$surface"
+  return $?
+}
+
+# tty/ps 기반 감지가 실패했을 때의 마지막 폴백 — surface title 의 LLM 키워드로 추정.
+# 이전에는 곧장 unknown(rc 3, "--mode 명시 필요")으로 죽었지만, title 기반 호출
+# 패턴(cmuxs codex ...)에서 title 이 이미 정체를 말해주는 경우가 대부분이다.
+# 키워드 미스면 기존과 동일하게 unknown rc 1.
+_cmux_v5_detect_title_hint() {
+  local surface="$1" title lower
+  title="$(_cmux_v5_surface_title "$surface")"
+  lower="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    *codex*|*claude*|*gemini*|*agy*|*antigravity*|*minimax*|*opencode*|*junie*)
+      echo llm; return 0 ;;
+  esac
   echo unknown
   return 1
 }
@@ -811,18 +907,25 @@ _cmux_v5_pick_ans() {
 #   짧은 간격으로 폴링한다. async(send→나중 collect)·sync(ask) 모두 동일하게 동작하고,
 #   응답자가 파이프 reader 유무와 무관히 답을 쓰므로 codex/agy/minimax(pi) 등 모든
 #   sidecar 에서 견고하다. mv 가 atomic 이라 torn read 없음.
+#   완료 판정은 -f (존재) — mv 가 원자적이라 .ans 가 보이면 기록 완료다. -s (non-empty)
+#   를 쓰면 side-effect-only worker 명령의 0바이트 정답이 timeout 까지 hang 된다.
+#   deadline 은 SECONDS builtin(bash/zsh 공통)으로 계산해 매 iteration 의 date fork 를
+#   없애고, surface alive 체크는 ~3초(15 tick)마다만 수행해 폴링 fork 를 줄인다.
 #   rc: 0=수신, 124=timeout, 125=surface gone(early give-up).
 _cmux_v5_await_ans() {
   local ans="$1" timeout="$2" rmax="$3" surface="${4:-}"
-  local deadline
-  deadline=$(( $(date +%s) + timeout ))
+  local end=$(( SECONDS + timeout )) tick=0
   while :; do
-    if [ -s "$ans" ]; then
+    if [ -f "$ans" ]; then
       _cmux_v5_read_ans_file "$ans" "$rmax"
       return 0
     fi
-    [ -n "$surface" ] && ! _cmux_v5_surface_alive "$surface" && return 125
-    [ "$(date +%s)" -ge "$deadline" ] && return 124
+    if [ -n "$surface" ] && [ $(( tick % 15 )) -eq 0 ] \
+       && ! _cmux_v5_surface_alive "$surface"; then
+      return 125
+    fi
+    [ "$SECONDS" -ge "$end" ] && return 124
+    tick=$((tick + 1))
     sleep 0.2
   done
 }
@@ -898,9 +1001,16 @@ _cmux_v5_send() {
   local surface="$1" full="$2"
   # send 와 send-key 가 별개 RPC. 데몬 처리 race 로 Enter 가 본문보다 먼저
   # 도착 / 휘발할 수 있어 짧은 stall + 재시도 패턴.
-  cmux send --surface "$surface" -- "$full" >/dev/null 2>&1 || return 1
+  # 데몬 일시 busy 로 RPC 가 한 번 튕기는 transient 실패는 0.3s 후 1회 재시도.
+  if ! cmux send --surface "$surface" -- "$full" >/dev/null 2>&1; then
+    sleep 0.3
+    cmux send --surface "$surface" -- "$full" >/dev/null 2>&1 || return 1
+  fi
   sleep "${CMUX_V5_ENTER_DELAY:-0.15}"
-  cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || return 1
+  if ! cmux send-key --surface "$surface" Enter >/dev/null 2>&1; then
+    sleep 0.3
+    cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || return 1
+  fi
   # Enter 휘발 보험. 빈 라인 한 번 더 — sidecar 입력창에 무해.
   if [ "${CMUX_V5_ENTER_DOUBLE:-on}" = "on" ]; then
     sleep 0.05
@@ -964,16 +1074,10 @@ _cmux_v5_read_fifo_dynamic() {
   local poll_interval="${CMUX_V5_POLL_INTERVAL:-1}"
   local max_idle_checks="${CMUX_V5_MAX_IDLE_CHECKS:-10}"
 
-  # TTY 한번만 조회
+  # TTY 한번만 조회 (surface 토큰 정확 일치 — substring 오매칭 방지)
   local tty="" short=""
   if [ -n "$surface" ]; then
-    tty="$(_cmux_v5_get_tree \
-      | awk -v s="$surface" '
-          $0 ~ s {
-            if (match($0, /tty=[^ ]+/)) {
-              print substr($0, RSTART+4, RLENGTH-4); exit
-            }
-          }')"
+    tty="$(_cmux_v5_surface_tty "$surface")"
     if [ -n "$tty" ]; then
       short="${tty##/dev/}"
     fi
@@ -1694,13 +1798,14 @@ cmux_check() {
   ans="${fifo%.res}.ans"
   # pending 마커(.res)도 .ans 도 없으면 그런 job 없음.
   { [ -p "$fifo" ] || [ -e "$ans" ]; } || return 2
-  # 준비 판정 = .ans 가 non-empty 로 나타남(응답자가 atomic mv 로 기록 완료).
+  # 준비 판정 = .ans 가 나타남(응답자가 atomic mv 로 기록 완료). -e 라서 0바이트
+  # side-effect-only 답변도 ready 로 본다(await_ans 와 동일 계약).
   perl - "$ans" "$wait_s" "$interval" <<'PERL'
 use Time::HiRes qw(time sleep);
 my ($ans, $wait_s, $interval) = @ARGV;
 my $deadline = time + $wait_s;
 while (1) {
-  if (-s $ans) { exit 0; }
+  if (-e $ans) { exit 0; }
   last if time >= $deadline;
   sleep $interval;
 }
@@ -1736,13 +1841,7 @@ cmux_tail() {
   local surface tty short
   surface="$(_cmux_v5_fifo_to_surface "$fifo")"
   if [ -n "$surface" ]; then
-    tty="$(_cmux_v5_get_tree \
-      | awk -v s="$surface" '
-          $0 ~ s {
-            if (match($0, /tty=[^ ]+/)) {
-              print substr($0, RSTART+4, RLENGTH-4); exit
-            }
-          }')"
+    tty="$(_cmux_v5_surface_tty "$surface")"
     if [ -n "$tty" ]; then
       short="${tty##/dev/}"
     fi

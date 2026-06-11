@@ -3,7 +3,19 @@ name: cmux
 description: cmux sidecar 사이의 짧은 agent-to-agent 통신. v5는 per-job FIFO 응답 채널과 자동 모드 감지(LLM|worker)를 사용한다. 짧은 ack/조회/단일 명령 위임에만 사용하고 큰 작업 위임은 금지한다.
 ---
 
-# cmux v5 (v5.2 고성능/고신뢰성 패치 적용)
+# cmux v5 (v5.3 고성능/고신뢰성 패치 적용)
+
+v5.3 변경점:
+
+- **다중매치 lowest-wins 실제 적용**: 같은 title 의 surface 가 여러 개여도 rc=6 으로 죽지 않고 숫자상 가장 낮은 `surface:N` 을 선택 + stderr 경고 (문서 계약과 코드 일치화).
+- **빈 응답 즉시 회수**: 0바이트 `.ans`(side-effect-only worker 답변)가 timeout 까지 hang 되지 않고 즉시 rc=0 으로 회수됩니다.
+- **tree 캐시 파일(L2) 공유**: `cmux tree` 결과를 `$CMUX_V5_FIFO_DIR/.tree-*.cache` 에 원자 기록하여 command-substitution 서브셸·새 셸 세션에서도 TTL 내 재사용 — resolve→detect→collect 경로의 tree fork 가 호출당 3~4회 → 최대 1회로 감소.
+- **surface:N substring 오탐 수정**: tty 조회가 `surface:1` 을 `surface:10` 라인에 오매칭하던 버그 수정 (정확 토큰 비교).
+- **모드 감지 title 힌트 폴백**: tty/ps 기반 감지 실패 시 surface title 의 LLM 키워드(codex/claude/gemini/agy/minimax 등)로 추정 — rc=3 "--mode 명시" 실패가 대폭 감소.
+- **send RPC 1회 재시도**: `cmux send`/`send-key` 가 transient 하게 튕기면 0.3s 후 1회 재시도.
+- **폴링 fork 절감**: `.ans` 대기 루프가 `date` fork 없이 `SECONDS` builtin 으로 deadline 을 계산하고, surface alive 체크를 ~3초 간격으로 묶음.
+
+v5.2:
 
 - **Perl 기반 Event-Loop**: dynamic read 시 매초 fork하던 오버헤드를 O(1)로 줄였습니다.
 - **Non-destructive Check**: `cmux_check`가 FIFO를 직접 열지 않고 `lsof`를 통해 writer 존재를 파악해 `SIGPIPE` 레이스를 원천 차단했습니다.
@@ -96,7 +108,7 @@ target 인자는 현재 workspace 안의 pane name, surface title, 또는 `surfa
 | `CMUX_V5_SEND_TIMEOUT` | 3600 | `cmux_send`/`cmuxs` 기본 watch 최대 초 (1시간) |
 | `CMUX_V5_WATCH_INTERVAL` | 15 | `cmux_send`/`cmuxs` 기본 watch status 간격(초) |
 | `CMUX_V5_AUTO_CAP` | on | LLM 수신 규칙 자동 첨부 |
-| `CMUX_V5_TREE_TTL` | 3 | `cmux tree` 캐시 TTL(초). resolve→detect→read 간 fork 재사용 |
+| `CMUX_V5_TREE_TTL` | 3 | `cmux tree` 캐시 TTL(초). 셸 변수(L1) + `$CMUX_V5_FIFO_DIR/.tree-*.cache` 파일(L2, 서브셸/세션 간 공유). `0` 이면 캐시 전체 bypass |
 | `CMUX_V5_CROSS_TIMEOUT` | 1800 | `cmux_cross` 각 LLM 호출 timeout(초). 기본 30분 |
 | `CMUX_V5_CROSS_RESPONSE_MAX` | 16384 | `cmux_cross` 라운드별 응답 바이트 캡 (토큰 bound) |
 | `CMUX_V5_CROSS_TRANSCRIPT_MAX` | 32768 | `cmux_cross` 프롬프트에 재삽입하는 누적 토론 기록 cap |
@@ -118,7 +130,8 @@ target 인자는 현재 workspace 안의 pane name, surface title, 또는 `surfa
 
 - `claude`, `codex`, `gemini`, `pi` 등이 보이면 `llm`
 - shell만 보이면 `worker`
-- 실패하면 `--mode llm|worker`를 명시한다
+- tty/ps 감지 실패 시 surface title 의 LLM 키워드(codex/claude/gemini/agy/antigravity/minimax/opencode/junie)로 폴백
+- 그래도 실패하면 `--mode llm|worker`를 명시한다
 
 Worker mode는 focused/current surface에 기본 전송하지 않는다(`CMUX_V5_WORKER_FOCUS_GUARD=off`로 override). PTY에 키스트로크가 주입되므로 사람이 입력 중인 surface에 보내면 입력이 오염될 수 있다.
 
